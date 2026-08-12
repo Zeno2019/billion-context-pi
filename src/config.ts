@@ -37,6 +37,12 @@ export interface AdapterConfig {
    *  head-truncated with a notice telling the model how to see the full output
    *  (bash: read BashToolDetails.fullOutputPath). */
   toolOutputMaxBytes?: number;
+  /** Directory containing agent Markdown files (one per `<name>.md`). When
+   *  set, `acp_delegate` loads agent definitions from this directory in
+   *  addition to (or overriding) the built-in roster. Supports `~` expansion.
+   *  When absent, only built-in agents are available - existing behavior is
+   *  fully preserved (opt-in). */
+  agentDir?: string;
   coreOverrides?: Partial<Config>;
 }
 

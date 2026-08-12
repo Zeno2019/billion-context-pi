@@ -15,6 +15,7 @@ export interface UserAcpConfig {
   delegate?: boolean;
   toolBashDefaultTimeout?: number;
   toolOutputMaxBytes?: number;
+  agentDir?: string;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -42,12 +43,17 @@ function join(... parts: string[]): string {
   return path.join(...parts);
 }
 
-const KNOWN = new Set(["debug", "autoUpdate", "modelContextLimit", "delegate", "toolBashDefaultTimeout", "toolOutputMaxBytes"]);
+const KNOWN = new Set(["debug", "autoUpdate", "modelContextLimit", "delegate", "toolBashDefaultTimeout", "toolOutputMaxBytes", "agentDir"]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
   const out: UserAcpConfig = {};
   for (const [k, v] of Object.entries(parsed)) {
-    if (KNOWN.has(k)) (out as Record<string, unknown>)[k] = v;
+    if (!KNOWN.has(k)) continue;
+    if (k === "agentDir") {
+      if (typeof v === "string" && v.trim().length > 0) out.agentDir = v.trim();
+      continue;
+    }
+    (out as Record<string, unknown>)[k] = v;
   }
   return out;
 }
@@ -63,5 +69,7 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
     coreOverrides: adapter.coreOverrides,
     protectedTools: adapter.protectedTools,
     preserveRecentMessages: adapter.preserveRecentMessages,
+    // agentDir from user config overrides factory; if neither sets it, stays
+    // undefined and built-in-only behavior is preserved (opt-in).
   };
 }

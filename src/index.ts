@@ -12,7 +12,7 @@ import { makeCompressTool } from "./compress-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
-import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot } from "./delegate-tool.js";
+import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, makeDelegateAgentsTool, runningRunsSnapshot } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { coreOutToAgentMessages } from "./messages.js";
 import { ACP_SYSTEM_PROMPT, ACP_DELEGATE_PROMPT } from "./system-prompt.js";
@@ -71,9 +71,10 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime): void {
       // best-effort — fall back to factory/env config
     }
     if (runtime.adapter.delegate !== false) {
-      pi.registerTool(makeDelegateTool(pi));
+      pi.registerTool(makeDelegateTool(pi, runtime.adapter.agentDir));
       pi.registerTool(makeDelegateWaitTool(pi));
       pi.registerTool(makeDelegateCancelTool(pi));
+      pi.registerTool(makeDelegateAgentsTool(runtime.adapter.agentDir));
     }
     void checkForUpdate(runtime.adapter.autoUpdate ?? true, (msg) => {
       if (ctx.hasUI) ctx.ui.notify(msg);

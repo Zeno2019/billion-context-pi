@@ -1,12 +1,20 @@
 import {
   spawn,
   type ChildProcess,
+  type SpawnOptionsWithStdioTuple,
 } from "node:child_process";
-import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
 import { delegateStatusWidget } from "./fleet-widget.js";
+import {
+  resolveAgentDir,
+  loadAgentDef,
+  discoverAgentDefs,
+  VALID_THINKING_LEVELS,
+  type AgentDirDef,
+} from "./delegate-agents.js";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -17,8 +25,38 @@ import { debug } from "./log.js";
 
 const MAX_DEPTH = 2;
 const SYNC_TIMEOUT_MS = 5 * 60_000;
+const TIMEOUT_GRACE_MS = 5_000;
 const RESULT_SUMMARY_CHARS = 500;
 const OUT_DIR = join(tmpdir(), "acp-delegate");
+
+/**
+ * @internal Minimal DI seam for tests: production always uses Node's native
+ * spawn/setTimeout/clearTimeout (see DEFAULT_RUNTIME_HOOKS below). Tests may
+ * pass a fake so they can observe spawn, kill(SIGTERM/SIGKILL), and
+ * scheduled/cleared timers without spawning a real child process. This is a
+ * test-only hook — not part of the public delegate API surface. The hooks are
+ * invoked lazily on every call, so swapping the global timers (e.g. node:test
+ * mock timers) also affects the default implementation.
+ */
+export interface DelegateRuntimeHooks {
+  /** Spawn a delegate child process. Default: node:child_process.spawn. */
+  spawn(
+    command: string,
+    args: string[],
+    options: SpawnOptionsWithStdioTuple<"pipe", "pipe", "pipe">,
+  ): ChildProcess;
+  /** Schedule a one-shot timer. Default: global setTimeout. */
+  setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
+  /** Cancel a scheduled timer. Default: global clearTimeout. */
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+}
+
+/** @internal Production defaults — direct passthrough to Node natives. */
+export const DEFAULT_RUNTIME_HOOKS: DelegateRuntimeHooks = {
+  spawn: (command, args, options) => spawn(command, args, options),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
 
 /** ACP context-management tools that every restricted delegate must retain
  *  so it can manage its own context under billion-context-pi. */
@@ -78,9 +116,194 @@ Answer the question concisely with clear reasoning. Cite file:line when referenc
 
 const AGENT_NAMES = Object.keys(AGENTS);
 
+// ─── Agent resolution (configured md > built-in) ─────────────────────────────
+
+/** Effective agent definition after resolving configured md overrides
+ *  against built-in agents. Used by runDelegate and buildChildArgs. */
+interface ResolvedAgent {
+  name: string;
+  source: "configured" | "built-in";
+  prompt: string;
+  /** Configured agent: tool allowlist from md frontmatter. */
+  tools?: string[];
+  /** Built-in restricted role: the tools string from AGENTS. */
+  builtInTools?: string;
+  /** Built-in: whether the role receives a --tools allowlist. */
+  restricted?: boolean;
+  /** Configured agent: model override from md ("provider/id"). */
+  model?: string;
+  /** Configured agent: thinking level from md. */
+  thinking?: string;
+  /** Configured agent: model allowlist from md (not auto-fallback). */
+  allowedModels?: string[];
+  /** Configured agent: timeout in seconds from md. */
+  timeout?: number;
+}
+
+type ResolveResult =
+  | { ok: true; agent: ResolvedAgent }
+  | { ok: false; error: string };
+
+/** Resolve an agent by name, checking configured agentDir first, then
+ *  falling back to built-in AGENTS.
+ *
+ * Resolution logic:
+ * 1. If agentDir is configured, check if `<name>.md` exists.
+ *    a. File exists and valid → configured agent overrides built-in.
+ *    b. File exists but invalid → fail closed (return error, NO fallback).
+ *    c. File doesn't exist → fall through to built-in.
+ * 2. If not configured (or file not found), check built-in AGENTS.
+ *    a. Found → built-in agent.
+ *    b. Not found → unknown agent error.
+ *
+ * Unknown agents with a configured file are allowed (custom agents).
+ * Unknown agents without a configured file are rejected.
+ */
+async function resolveAgent(
+  agentName: string,
+  resolvedDir: string | undefined,
+): Promise<ResolveResult> {
+  // Try configured agent file first
+  if (resolvedDir) {
+    const filePath = join(resolvedDir, `${agentName}.md`);
+    let fileExists = false;
+    try {
+      await access(filePath);
+      fileExists = true;
+    } catch {
+      fileExists = false;
+    }
+
+    if (fileExists) {
+      const result = await loadAgentDef(agentName, resolvedDir);
+      if (!result.ok) {
+        // File exists but failed to load/validate → fail closed
+        return {
+          ok: false,
+          error: `Agent "${agentName}" has a configured file but it failed to load: ${result.reason}`,
+        };
+      }
+      // Configured agent overrides built-in
+      const def = result.def;
+      return {
+        ok: true,
+        agent: {
+          name: agentName,
+          source: "configured",
+          prompt: def.prompt,
+          tools: def.tools,
+          model: def.model,
+          thinking: def.thinking,
+          allowedModels: def.allowedModels,
+          timeout: def.timeout,
+        },
+      };
+    }
+  }
+
+  // Fall back to built-in
+  const builtIn = AGENTS[agentName];
+  if (!builtIn) {
+    const hint = resolvedDir
+      ? ` Built-in: ${AGENT_NAMES.join(", ")}. Custom agents can be configured via agentDir.`
+      : ` Choose one of: ${AGENT_NAMES.join(", ")}.`;
+    return {
+      ok: false,
+      error: `Unknown agent "${agentName}".${hint}`,
+    };
+  }
+
+  return {
+    ok: true,
+    agent: {
+      name: agentName,
+      source: "built-in",
+      prompt: builtIn.prompt,
+      restricted: builtIn.restricted,
+      builtInTools: builtIn.tools,
+    },
+  };
+}
+
+/** Build a sanitized dryRun plan without spawning a child or creating temp
+ *  files. Returns the effective resolution + arg plan.
+ *
+ * Sanitization:
+ * - No prompt body (only notes that --append-system-prompt will be used)
+ * - No full env or credentials
+ * - No temp file paths (only flag names)
+ * - Tool names listed (not tool contents)
+ */
+function planDryRun(
+  args: DelegateArgs,
+  resolved: ResolvedAgent,
+  ctx: ExtensionContext,
+  effectiveTimeoutSec?: number,
+): string {
+  // Effective model resolution: args.model > resolved.model > ctx.model
+  let effectiveModel: string;
+  let modelSource: string;
+  if (args.model && args.model.includes("/")) {
+    effectiveModel = args.model;
+    modelSource = "per-call override";
+  } else if (resolved.model) {
+    effectiveModel = resolved.model;
+    modelSource = "agent file";
+  } else if (ctx.model) {
+    effectiveModel = `${ctx.model.provider}/${ctx.model.id}`;
+    modelSource = "inherited from parent";
+  } else {
+    effectiveModel = "(not set — Pi default)";
+    modelSource = "Pi default";
+  }
+
+  // Effective thinking: args.thinking > resolved.thinking
+  const effectiveThinking = args.thinking ?? resolved.thinking;
+
+  // Effective tools
+  let toolsLine: string;
+  if (resolved.tools && resolved.tools.length > 0) {
+    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
+    toolsLine = `${merged.join(", ")} (--tools allowlist)`;
+  } else if (resolved.restricted && resolved.builtInTools) {
+    const merged = [...new Set([...resolved.builtInTools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    toolsLine = `${merged.join(", ")} (--tools allowlist)`;
+  } else {
+    toolsLine = "ambient (full default toolset, no --tools restriction)";
+  }
+
+  const cwd = args.cwd && args.cwd.trim() ? args.cwd : ctx.cwd;
+
+  // Effective timeout: args.timeout > resolved.timeout
+  const effectiveTimeout = effectiveTimeoutSec ?? args.timeout ?? resolved.timeout;
+
+  const lines: string[] = [
+    `**DryRun plan for agent "${args.agent}"**`,
+    ``,
+    `- source: ${resolved.source}${resolved.source === "configured" ? " (from agentDir)" : ""}`,
+    `- model: ${effectiveModel} (${modelSource})`,
+    `- thinking: ${effectiveThinking ?? "(not set)"}`,
+    `- tools: ${toolsLine}`,
+    `- timeout: ${effectiveTimeout ? `${effectiveTimeout}s` : "(not set)"}`,
+    `- cwd: ${cwd}`,
+    `- freshContext: true (pi -p --no-session)`,
+  ];
+
+  // CLI flags that would be emitted (names only, no temp paths)
+  const flags: string[] = ["-p", "--no-session", "--append-system-prompt"];
+  if (resolved.tools || (resolved.restricted && resolved.builtInTools)) {
+    flags.push("--tools");
+  }
+  if (effectiveModel.includes("/")) flags.push("--provider", "--model");
+  if (effectiveThinking) flags.push("--thinking");
+  lines.push(`- CLI flags: ${flags.join(", ")}`);
+
+  return lines.join("\n");
+}
+
 // ─── Run registry (module-level, shared across tools) ───────────────────────
 
-type RunStatus = "running" | "completed" | "failed" | "cancelled";
+type RunStatus = "running" | "terminating" | "completed" | "failed" | "cancelled" | "timed_out";
 
 interface DelegateRun {
   runId: string;
@@ -99,6 +322,14 @@ interface DelegateRun {
    *  re-delivering the same payload. */
   injected?: boolean;
   waiter?: () => void;
+  /** Effective timeout in ms, for reporting. */
+  timeoutMs?: number;
+  /** SIGTERM timer for async timeout. */
+  timeoutTimer?: ReturnType<typeof setTimeout>;
+  /** SIGKILL grace timer after timeout SIGTERM. */
+  graceTimer?: ReturnType<typeof setTimeout>;
+  /** When the timeout fired (timestamp). */
+  timedOutAt?: number;
 }
 
 const runs = new Map<string, DelegateRun>();
@@ -107,7 +338,7 @@ const runs = new Map<string, DelegateRun>();
 export function runningRunsSnapshot(): { runId: string; agent: string; task: string; startedAt: number }[] {
   const out: { runId: string; agent: string; task: string; startedAt: number }[] = [];
   for (const r of runs.values()) {
-    if (r.status === "running") out.push({ runId: r.runId, agent: r.agent, task: r.task, startedAt: r.startedAt });
+    if (r.status === "running" || r.status === "terminating") out.push({ runId: r.runId, agent: r.agent, task: r.task, startedAt: r.startedAt });
   }
   return out;
 }
@@ -117,7 +348,7 @@ const WAIT_TIMEOUT_MS_MAX = 300_000;
 
 const DelegateParams = Type.Object({
   agent: Type.String({
-    description: `Role of the delegate. One of: ${AGENT_NAMES.join(", ")}. See tool description for what each does.`,
+    description: `Role of the delegate. Built-in: ${AGENT_NAMES.join(", ")}. Custom agents may be available if configured via the \`agentDir\` setting in ~/.pi/acp.json.`,
   }),
   task: Type.String({
     description: "The self-contained task to hand off. State purpose, scope, and any constraints explicitly.",
@@ -126,11 +357,27 @@ const DelegateParams = Type.Object({
     Type.String({ description: "Working directory for the delegate (default: current project dir)." }),
   ),
   model: Type.Optional(
-    Type.String({ description: 'Model override as "provider/id" (default: inherit current model).' }),
+    Type.String({ description: 'Model override as "provider/id" (default: inherit current model or agent file setting).' }),
+  ),
+  thinking: Type.Optional(
+    Type.String({
+      description: `Thinking level override. One of: ${[...VALID_THINKING_LEVELS].join(", ")}. Default: inherit from agent file or parent.`,
+    }),
   ),
   async: Type.Optional(
     Type.Boolean({
       description: "If true (default), return immediately with a runId. In long-lived sessions (interactive/rpc) a short notification is injected into chat when the delegate finishes; in one-shot sessions (print/json, e.g. `pi -p` / SDK) async auto-downgrades to sync and the result is returned here. If false, always block and return the output here.",
+    }),
+  ),
+  dryRun: Type.Optional(
+    Type.Boolean({
+      description: "If true, resolve and validate the agent, model, thinking, and tools, but do NOT spawn a child process. Returns a sanitized effective plan (no prompt body, no env, no temp paths). Use to preview what a delegate run would do.",
+    }),
+  ),
+  timeout: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Maximum runtime in seconds (positive integer). When reached, the delegate is sent SIGTERM (then SIGKILL after a short grace). Default: no timeout (async runs indefinitely until completion or cancel; sync runs bounded by 5min safety limit). Priority: per-call > agent file > none.",
     }),
   ),
 });
@@ -163,7 +410,12 @@ const agentListLine = (name: string): string => {
   return `  • ${name} - ${blurb[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
 };
 
-export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof DelegateParams> {
+export function makeDelegateTool(
+  pi: ExtensionAPI,
+  agentDir?: string,
+  /** @internal Test-only DI seam — see DelegateRuntimeHooks. */
+  runtimeHooks: DelegateRuntimeHooks = DEFAULT_RUNTIME_HOOKS,
+): ToolDefinition<typeof DelegateParams> {
   return {
     name: "acp_delegate",
     label: "ACP Delegate",
@@ -190,17 +442,16 @@ The delegate runs in its own clean pi process — it does NOT see this conversat
     parameters: DelegateParams,
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       const args = params as DelegateArgs;
-      const outcome = await runDelegate(pi, args, ctx, signal);
+      const outcome = await runDelegate(pi, args, ctx, signal, agentDir, runtimeHooks);
       return { details: undefined, content: [{ type: "text", text: outcome }] };
     },
   };
 }
 
 function formatRunResult(run: DelegateRun): string {
-  const header =
-    run.status === "completed"
-      ? `Delegate **${run.agent}** (runId \`${run.runId}\`) completed (exit ${run.exitCode ?? "?"})${remainingLineForWait(run.runId)}`
-      : `Delegate **${run.agent}** (runId \`${run.runId}\`) ${run.status} (exit ${run.exitCode ?? "?"})${remainingLineForWait(run.runId)}`;
+  // "timed out" reads better than the raw "timed_out" status token.
+  const statusStr = run.status === "timed_out" ? "timed out" : run.status;
+  const header = `Delegate **${run.agent}** (runId \`${run.runId}\`) ${statusStr} (exit ${run.exitCode ?? "?"})${remainingLineForWait(run.runId)}`;
   return formatPayload(header, run.result?.file ?? "", run.task, run.result?.body);
 }
 
@@ -251,7 +502,12 @@ export function makeDelegateWaitTool(_pi: ExtensionAPI): ToolDefinition<typeof W
         run.consumed = true;
         return { details: undefined, content: [{ type: "text", text: `Delegate \`${args.runId}\` was cancelled (no result).${remainingLineForWait(args.runId)}` }] };
       }
-      if (run.status !== "running") {
+      // Terminating (timeout requested, child still in the SIGTERM grace
+      // window, result not yet persisted) is NOT terminal: park a waiter like
+      // a running run. Only close + persist flip the status to timed_out; an
+      // early-return here would claim a "persist error" and consume the run,
+      // suppressing the real notification.
+      if (run.status !== "running" && run.status !== "terminating") {
         // The delegate already finished. If the close handler already injected
         // its result as a system notification (it fired before this wait was
         // called), don't re-deliver the full payload — point at the file
@@ -315,7 +571,11 @@ export function makeDelegateWaitTool(_pi: ExtensionAPI): ToolDefinition<typeof W
   };
 }
 
-export function makeDelegateCancelTool(_pi: ExtensionAPI): ToolDefinition<typeof CancelParams> {
+export function makeDelegateCancelTool(
+  _pi: ExtensionAPI,
+  /** @internal Test-only DI seam — see DelegateRuntimeHooks. */
+  runtimeHooks: DelegateRuntimeHooks = DEFAULT_RUNTIME_HOOKS,
+): ToolDefinition<typeof CancelParams> {
   return {
     name: "acp_delegate_cancel",
     label: "ACP Delegate Cancel",
@@ -341,6 +601,10 @@ export function makeDelegateCancelTool(_pi: ExtensionAPI): ToolDefinition<typeof
       }
       run.status = "cancelled";
       run.consumed = true; // suppress injection; the waiter (if any) gets cancelled status
+      // Cancel wins over any pending timeout: clear both timers so the child
+      // is not SIGTERM'd again by the timeout (and no grace/SIGKILL fires).
+      if (run.timeoutTimer) { runtimeHooks.clearTimeout(run.timeoutTimer); run.timeoutTimer = undefined; }
+      if (run.graceTimer) { runtimeHooks.clearTimeout(run.graceTimer); run.graceTimer = undefined; }
       try {
         run.child?.kill("SIGTERM");
       } catch (err) {
@@ -360,11 +624,17 @@ async function runDelegate(
   args: DelegateArgs,
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
+  agentDir?: string,
+  runtimeHooks: DelegateRuntimeHooks = DEFAULT_RUNTIME_HOOKS,
 ): Promise<string> {
-  const agent = AGENTS[args.agent];
-  if (!agent) {
-    return `Unknown agent "${args.agent}". Choose one of: ${AGENT_NAMES.join(", ")}.`;
+  // Resolve agent: configured md > built-in
+  const resolvedDir = resolveAgentDir(agentDir);
+  const resolution = await resolveAgent(args.agent, resolvedDir);
+  if (!resolution.ok) {
+    return resolution.error;
   }
+  const resolved = resolution.agent;
+
   const parentDepth = Number(process.env.PI_ACP_DELEGATE_DEPTH ?? "0");
   if (Number.isNaN(parentDepth) || parentDepth >= MAX_DEPTH) {
     return `Delegate nesting limit reached (depth ${parentDepth}, max ${MAX_DEPTH}). The delegate cannot spawn further delegates.`;
@@ -373,13 +643,52 @@ async function runDelegate(
     return `Task must be a non-empty string. Got: ${JSON.stringify(args.task).slice(0, 60)}`;
   }
 
+  // Validate per-call thinking override
+  if (args.thinking && !VALID_THINKING_LEVELS.has(args.thinking)) {
+    return `Invalid thinking level "${args.thinking}". Valid levels: ${[...VALID_THINKING_LEVELS].join(", ")}`;
+  }
+
+  // Effective timeout: args.timeout > resolved.timeout > none
+  const effectiveTimeoutSec = args.timeout ?? resolved.timeout;
+  const effectiveTimeoutMs = effectiveTimeoutSec ? effectiveTimeoutSec * 1000 : undefined;
+
+  // Model validation: for configured agents with allowed-models or model set,
+  // the caller's model must be in the allowed set (md.model + allowedModels).
+  // This is NOT a fallback list - it's an allowlist. No auto-retry.
+  if (resolved.source === "configured" && args.model) {
+    const hasAllowedModels = resolved.allowedModels && resolved.allowedModels.length > 0;
+    const hasModel = !!resolved.model;
+    if (hasAllowedModels || hasModel) {
+      const allowed = new Set<string>([
+        ...(resolved.allowedModels ?? []),
+        ...(resolved.model ? [resolved.model] : []),
+      ]);
+      if (!allowed.has(args.model)) {
+        return `Model "${args.model}" is not in the allowed set for agent "${args.agent}" (configured). Allowed models: ${[...allowed].join(", ")}. Remove the model override or use one of the allowed models.`;
+      }
+    }
+  }
+
   const cwd = args.cwd && args.cwd.trim() ? args.cwd : ctx.cwd;
   const childEnv = {
     ...process.env,
     PI_ACP_DELEGATE_DEPTH: String(parentDepth + 1),
   };
 
-  const { cliArgs, tmpDir } = await buildChildArgs(args, agent.prompt, ctx);
+  // dryRun: complete resolution + validation + arg planning, but NO spawn.
+  // Returns a sanitized plan (no prompt body, no env, no temp paths).
+  if (args.dryRun) {
+    debug.event("delegate-dryrun", {
+      agent: args.agent,
+      source: resolved.source,
+      hasModel: !!resolved.model,
+      hasThinking: !!resolved.thinking,
+      hasTools: !!(resolved.tools && resolved.tools.length > 0),
+    });
+    return planDryRun(args, resolved, ctx, effectiveTimeoutSec);
+  }
+
+  const { cliArgs, tmpDir } = await buildChildArgs(args, resolved.prompt, ctx, resolved);
   // One-shot modes (print/json = `pi -p` / SDK) exit after one turn, so async
   // injection (a follow-up turn) is never observed. Downgrade to sync there:
   // the result returns as the tool result within the same turn. Long-lived
@@ -396,12 +705,12 @@ async function runDelegate(
   // "pi-stable"). process.execPath is the Node binary, process.argv[1] is the
   // cli.js entrypoint of the currently running pi — together they always point
   // at the right executable regardless of how it was installed.
-  const child = spawn(process.execPath, [process.argv[1]!, ...cliArgs], {
+  const child = runtimeHooks.spawn(process.execPath, [process.argv[1]!, ...cliArgs], {
     cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     shell: process.platform === "win32",
-  }) as ChildProcess;
+  });
   // Pass the task via stdin (not argv) so tasks starting with `-` are not
   // mis-parsed as CLI options. pi reads piped stdin as the prompt in print mode.
   // N1: a fast-exiting child (bad provider, ENOENT, SIGTERM) closes the pipe
@@ -439,11 +748,47 @@ async function runDelegate(
     runs.set(runId, run);
     delegateStatusWidget.poke();
 
+    // Timeout timer: if an effective timeout is set, SIGTERM the child when
+    // it fires, then SIGKILL after a short grace. The timer is cleared on
+    // close/error/cancel — see those handlers below.
+    if (effectiveTimeoutMs && effectiveTimeoutMs > 0) {
+      run.timeoutMs = effectiveTimeoutMs;
+      run.timeoutTimer = runtimeHooks.setTimeout(() => {
+        // Only fire if the run is still genuinely running (not cancelled /
+        // already finalized by an error/close race).
+        if (run.status !== "running") return;
+        // Non-terminal "terminating" state: SIGTERM has been sent but the
+        // child may still be alive in the grace window. wait/cancel/widget
+        // treat this like running — the run becomes terminal timed_out only
+        // when close fires and the result is persisted (see close handler).
+        run.status = "terminating";
+        run.timedOutAt = Date.now();
+        debug.event("delegate-timeout", { runId, timeoutMs: effectiveTimeoutMs });
+        try {
+          run.child?.kill("SIGTERM");
+        } catch (err) {
+          debug.event("delegate-timeout-kill-error", { runId, signal: "SIGTERM", error: String(err) });
+        }
+        // Grace period: if the child ignores SIGTERM, escalate to SIGKILL.
+        run.graceTimer = runtimeHooks.setTimeout(() => {
+          try {
+            run.child?.kill("SIGKILL");
+          } catch (err) {
+            debug.event("delegate-timeout-kill-error", { runId, signal: "SIGKILL", error: String(err) });
+          }
+        }, TIMEOUT_GRACE_MS);
+        delegateStatusWidget.poke();
+      }, effectiveTimeoutMs);
+    }
+
     child.on("close", (code) => {
       void cleanupTmp(tmpDir);
+      // Clear timeout + grace timers (no-op when not set): the child is done,
+      // so the timer must not fire after finalization.
+      if (run.timeoutTimer) { runtimeHooks.clearTimeout(run.timeoutTimer); run.timeoutTimer = undefined; }
+      if (run.graceTimer) { runtimeHooks.clearTimeout(run.graceTimer); run.graceTimer = undefined; }
       const output = Buffer.concat(stdoutChunks).toString("utf8").trim();
       run.exitCode = code;
-      const body = code === 0 ? (output || "(no output)") : (stderrText.trim() || output || "(no output)");
       // N2: cancelled runs never persist a result — wake a parked waiter (if any)
       // and stop. status stays "cancelled" (set by cancel), so wait cannot
       // mistake it for a finished-with-result run.
@@ -454,13 +799,28 @@ async function runDelegate(
         delegateStatusWidget.poke();
         return;
       }
+      // Compute body + final status: terminating (set by the timeout timer
+      // before it killed the child, awaiting close) vs normal
+      // completion/failure. timed_out keeps its own status so
+      // wait/cancel/inject never misreport it.
+      let body: string;
+      let finalStatus: RunStatus;
+      if (run.status === "terminating") {
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+        const limitSec = run.timeoutMs ? Math.round(run.timeoutMs / 1000) : 0;
+        body = `(timed out after ${elapsedSec}s, limit ${limitSec}s)\n${output || "(no output)"}`;
+        finalStatus = "timed_out";
+      } else {
+        body = code === 0 ? (output || "(no output)") : (stderrText.trim() || output || "(no output)");
+        finalStatus = code === 0 ? "completed" : "failed";
+      }
       void persistResult(runId, body)
         .then((file) => {
           // Atomically flip status + result together: until this point the run
-          // is still "running" to any observer, so a concurrent wait cannot
-          // see "finished but result missing".
+          // is still "running" (or "timed_out") to any observer, so a concurrent
+          // wait cannot see "finished but result missing".
           run.result = { code, file, body };
-          run.status = code === 0 ? "completed" : "failed";
+          run.status = finalStatus;
           run.finishedAt = Date.now();
           // If a wait is parked on this run, wake it — it owns the result now
           // (and marks consumed so we don't double-deliver by injecting).
@@ -476,14 +836,16 @@ async function runDelegate(
             delegateStatusWidget.poke();
             return;
           }
-          const injected = injectResult(pi, args.agent, runId, args.task, code, file);
+          const injected = injectResult(pi, args.agent, runId, args.task, code, file, run.status);
           run.injected = injected;
           debug.event("delegate-done", { runId, code, status: run.status, injected, outLen: output.length, file });
           delegateStatusWidget.poke();
         })
         .catch((err) => {
           // Persist failed — still need to finalize so a waiter doesn't hang.
-          run.status = "failed";
+          // Preserve the timeout semantics if the run was terminating;
+          // otherwise fall back to failed.
+          run.status = run.status === "terminating" ? "timed_out" : "failed";
           run.finishedAt = Date.now();
           debug.event("delegate-done-error", { runId, error: String(err) });
           run.waiter?.();
@@ -492,10 +854,16 @@ async function runDelegate(
     });
     child.on("error", (err) => {
       void cleanupTmp(tmpDir);
+      // Clear timeout + grace timers: an error finalizes the run regardless of
+      // any pending timeout, so it must not fire afterwards.
+      if (run.timeoutTimer) { runtimeHooks.clearTimeout(run.timeoutTimer); run.timeoutTimer = undefined; }
+      if (run.graceTimer) { runtimeHooks.clearTimeout(run.graceTimer); run.graceTimer = undefined; }
       // Spawn-level error (e.g. EPIPE on a fast-exiting child, ENOENT).
       // Node does not guarantee a follow-up close, so finalize here too:
       // atomically set status + a synthetic result, and wake a parked waiter.
       // The settled guard in close (if it does fire) prevents double-finalize.
+      // Note: a timed_out run is NOT finalized here — its close handler owns
+      // the timeout result; an error after SIGTERM/SIGKILL is expected noise.
       if (run.status === "running" || run.status === "cancelled") {
         run.status = run.status === "cancelled" ? "cancelled" : "failed";
         run.finishedAt = Date.now();
@@ -518,8 +886,13 @@ async function runDelegate(
     ].join("\n");
   }
 
-  // Sync: block until the child finishes (bounded by a timeout).
-  const result = await waitForChild(child, signal);
+  // Sync: block until the child finishes. Bounded by the shorter of the
+  // effective timeout and the SYNC_TIMEOUT_MS safety ceiling — a configured
+  // timeout never EXTENDS the 5min compat limit, only shortens it.
+  const syncTimeoutMs = effectiveTimeoutMs
+    ? Math.min(effectiveTimeoutMs, SYNC_TIMEOUT_MS)
+    : SYNC_TIMEOUT_MS;
+  const result = await waitForChild(child, signal, syncTimeoutMs, startedAt, runtimeHooks);
   void cleanupTmp(tmpDir);
   const body =
     result.timedOut || result.code !== 0
@@ -533,6 +906,7 @@ export async function buildChildArgs(
   args: DelegateArgs,
   rolePrompt: string,
   ctx: ExtensionContext,
+  resolved?: ResolvedAgent,
 ): Promise<{ cliArgs: string[]; tmpDir: string }> {
   const tmpDir = await mkdtemp(join(tmpdir(), "acp-delegate-"));
   // Combine the role prompt with a small framing instruction so the child
@@ -542,24 +916,47 @@ export async function buildChildArgs(
 
   const cliArgs = ["-p", "--no-session", "--append-system-prompt", promptFile];
 
-  // Restricted roles receive a tailored --tools allowlist. Worker and
-  // unknown agents are left on Pi's full default toolset (all extension/
-  // custom tools stay active). The allowlist is a *soft guardrail*: it
-  // prevents accidental edit/write by read-only roles, but bash can bypass
-  // it - this is not a security boundary.
-  const agentDef = AGENTS[args.agent];
-  if (agentDef?.restricted) {
-    const merged = [...new Set([...agentDef.tools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+  // Tools: configured agent tools > built-in restricted > none.
+  // When `resolved` is provided, use its tool info. When undefined (backward
+  // compat for existing tests), fall back to AGENTS lookup.
+  if (resolved?.tools && resolved.tools.length > 0) {
+    // Configured agent with tools: dedupe + append ACP context tools.
+    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
     cliArgs.push("--tools", merged.join(","));
+  } else if (resolved?.restricted && resolved.builtInTools) {
+    // Built-in restricted role.
+    const merged = [...new Set([...resolved.builtInTools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+    cliArgs.push("--tools", merged.join(","));
+  } else if (!resolved) {
+    // Backward compat: look up AGENTS directly (existing tests path).
+    const agentDef = AGENTS[args.agent];
+    if (agentDef?.restricted) {
+      const merged = [...new Set([...agentDef.tools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+      cliArgs.push("--tools", merged.join(","));
+    }
   }
+  // If resolved is provided but has no tools and is not restricted -> no
+  // --tools (ambient full default toolset, e.g. worker or custom unrestricted).
 
+  // Model: args.model > resolved.model > ctx.model
   if (args.model && args.model.includes("/")) {
     const [providerId, ...rest] = args.model.split("/");
+    const modelId = rest.join("/");
+    cliArgs.push("--provider", providerId!, "--model", modelId);
+  } else if (resolved?.model && resolved.model.includes("/")) {
+    // Configured agent model override.
+    const [providerId, ...rest] = resolved.model.split("/");
     const modelId = rest.join("/");
     cliArgs.push("--provider", providerId!, "--model", modelId);
   } else if (ctx.model) {
     // Inherit the parent's current model so the delegate runs on the same one.
     cliArgs.push("--provider", ctx.model.provider, "--model", ctx.model.id);
+  }
+
+  // Thinking: args.thinking > resolved.thinking
+  const effectiveThinking = args.thinking ?? resolved?.thinking;
+  if (effectiveThinking) {
+    cliArgs.push("--thinking", effectiveThinking);
   }
 
   return { cliArgs, tmpDir };
@@ -570,9 +967,19 @@ interface ChildResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Effective timeout limit in seconds (sync safety ceiling or shorter). */
+  timeoutLimitSec?: number;
+  /** Wall-clock elapsed seconds until the timeout fired. */
+  elapsedSec?: number;
 }
 
-function waitForChild(child: ChildProcess, signal: AbortSignal | undefined): Promise<ChildResult> {
+function waitForChild(
+  child: ChildProcess,
+  signal: AbortSignal | undefined,
+  timeoutMs: number = SYNC_TIMEOUT_MS,
+  startedAt: number = Date.now(),
+  runtimeHooks: DelegateRuntimeHooks = DEFAULT_RUNTIME_HOOKS,
+): Promise<ChildResult> {
   return new Promise((resolve) => {
     const stdoutChunks: Buffer[] = [];
     let stderrText = "";
@@ -581,19 +988,26 @@ function waitForChild(child: ChildProcess, signal: AbortSignal | undefined): Pro
       stderrText += c.toString("utf8");
     });
 
-    const timer = setTimeout(() => {
+    const timer = runtimeHooks.setTimeout(() => {
       child.kill("SIGTERM");
-      finish({ code: null, stdout: "", stderr: stderrText, timedOut: true });
-    }, SYNC_TIMEOUT_MS);
+      finish({
+        code: null,
+        stdout: "",
+        stderr: stderrText,
+        timedOut: true,
+        timeoutLimitSec: Math.round(timeoutMs / 1000),
+        elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+      });
+    }, timeoutMs);
 
     const onAbort = () => {
-      clearTimeout(timer);
+      runtimeHooks.clearTimeout(timer);
       child.kill("SIGTERM");
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
     function finish(r: ChildResult) {
-      clearTimeout(timer);
+      runtimeHooks.clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       resolve(r);
     }
@@ -613,12 +1027,19 @@ function waitForChild(child: ChildProcess, signal: AbortSignal | undefined): Pro
 }
 
 function formatSyncResult(agent: string, runId: string, task: string, r: ChildResult, file: string): string {
-  const status = r.timedOut ? "timed out" : r.code === 0 ? "completed" : "failed";
-  const header = `Delegate **${agent}** ${status} (runId \`${runId}\`, exit ${r.code ?? "?"}).`;
-  if (r.code === 0 && !r.timedOut) {
+  if (r.timedOut) {
+    // Distinguish timeout from failure: report the limit + elapsed explicitly.
+    const limit = r.timeoutLimitSec ? `${r.timeoutLimitSec}s` : "?";
+    const elapsed = r.elapsedSec ? `${r.elapsedSec}s` : "?";
+    const header = `Delegate **${agent}** timed out (runId \`${runId}\`, limit ${limit}, elapsed ${elapsed}).`;
     return formatPayload(header, file, task);
   }
-  const body = r.timedOut ? "(timed out)" : (r.stderr.trim() || "(no stderr)");
+  const status = r.code === 0 ? "completed" : "failed";
+  const header = `Delegate **${agent}** ${status} (runId \`${runId}\`, exit ${r.code ?? "?"}).`;
+  if (r.code === 0) {
+    return formatPayload(header, file, task);
+  }
+  const body = (r.stderr.trim() || "(no stderr)");
   return formatPayload(header, file, task, body);
 }
 
@@ -629,13 +1050,21 @@ function injectResult(
   task: string,
   code: number | null,
   file: string,
+  status: RunStatus,
 ): boolean {
   const send = pi.sendUserMessage;
   if (typeof send !== "function") {
     debug.event("delegate-inject-skipped", { runId, reason: "sendUserMessage unavailable" });
     return false;
   }
-  const status = code === 0 ? "completed" : "failed";
+  // Use the actual final status (completed/failed/timed_out) — never derive
+  // "failed" from a timeout exit code: the notification must distinguish
+  // timeout from failure, and cancelled never reaches this point.
+  const statusStr =
+    status === "timed_out" ? "timed out" :
+    status === "completed" ? "completed" :
+    status === "cancelled" ? "cancelled" :
+    "failed";
   // Tell the model how many other delegates are still running, so it doesn't
   // lose count when many were dispatched in a batch (e.g. launched 5, this is
   // the 2nd to return → "3 still running" → the model knows to keep waiting).
@@ -646,7 +1075,7 @@ function injectResult(
     remaining > 0
       ? ` ${remaining} delegate${remaining === 1 ? " is" : "s are"} still running; keep doing other work and their notifications will arrive as they finish.`
       : " No delegates are currently running.";
-  const header = `[acp_delegate ${status}] **${agent}** (runId \`${runId}\`, exit ${code ?? "?"})${remainingLine} This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request.`;
+  const header = `[acp_delegate ${statusStr}] **${agent}** (runId \`${runId}\`, exit ${code ?? "?"})${remainingLine} This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request.`;
   const text = formatPayload(header, file, task);
   try {
     // sendUserMessage is fire-and-forget (returns void): it enqueues a
@@ -710,4 +1139,102 @@ async function cleanupTmp(tmpDir: string | null): Promise<void> {
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1) + "…";
+}
+
+// ─── Agent discovery tool (read-only) ───────────────────────────────────────
+
+const AgentListParams = Type.Object({});
+
+/** Format a configured agent entry for the discovery tool output.
+ *  Deliberately minimal: name/source/model/thinking/tools policy/timeout —
+ *  never prompt body, env, credentials, or the absolute source path. */
+function formatConfiguredAgentLine(name: string, def: AgentDirDef, alsoBuiltIn: boolean): string {
+  const parts: string[] = [`  • ${name} [configured]`];
+  if (alsoBuiltIn) parts.push("(built-in also available)");
+  parts.push(`model: ${def.model ?? "(inherit)"}`);
+  parts.push(`thinking: ${def.thinking ?? "(not set)"}`);
+  if (def.tools && def.tools.length > 0) {
+    const merged = [...new Set([...def.tools, ...ACP_TOOLS])];
+    parts.push(`tools: ${merged.join(",")} (allowlist)`);
+  } else {
+    parts.push("tools: ambient (full default toolset)");
+  }
+  parts.push(`timeout: ${def.timeout ? `${def.timeout}s` : "(not set)"}`);
+  return parts.join(", ");
+}
+
+/** Format a built-in agent entry. When overridden by a configured file, the
+ *  built-in is noted as still available (the configured one is effective). */
+function formatBuiltInAgentLine(name: string, def: AgentDef, overridden: boolean): string {
+  const parts: string[] = [`  • ${name} [built-in]`];
+  if (overridden) parts.push("(overridden by configured — still available)");
+  parts.push("model: (inherit)");
+  parts.push("thinking: (not set)");
+  if (def.restricted) {
+    const merged = [...new Set([...def.tools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    parts.push(`tools: ${merged.join(",")} (allowlist)`);
+  } else {
+    parts.push("tools: ambient (full default toolset)");
+  }
+  parts.push("timeout: (not set)");
+  return parts.join(", ");
+}
+
+/** Read-only discovery tool: list all delegate agents (built-in + configured
+ *  + invalid). No side effects. A broken configured file is listed with its
+ *  reason but does NOT block other entries; a single acp_delegate call on an
+ *  invalid name still fails closed (see resolveAgent). */
+export function makeDelegateAgentsTool(agentDir?: string): ToolDefinition<typeof AgentListParams> {
+  return {
+    name: "acp_delegate_agents",
+    label: "ACP Delegate Agents",
+    description:
+      "List all available delegate agents (built-in roles plus any configured in the agentDir, e.g. ~/.pi/agent/agents). Read-only — no side effects. Shows the effective source, model, thinking, tools policy, and timeout for each agent, plus any configured agent files that failed to parse.",
+    promptSnippet: "acp_delegate_agents()",
+    promptGuidelines: [
+      "Call this before acp_delegate to discover valid agent names and their effective settings.",
+    ],
+    parameters: AgentListParams,
+    async execute(): Promise<AgentToolResult<unknown>> {
+      const lines: string[] = ["Available delegate agents (freshContext=true for all):", ""];
+
+      const resolvedDir = resolveAgentDir(agentDir);
+      const discovered = resolvedDir ? await discoverAgentDefs(resolvedDir) : [];
+      const validConfigured = discovered.filter((d) => d.ok);
+      const configuredNames = new Set(validConfigured.map((d) => d.name));
+
+      // Configured agents (valid) — the effective source for these names.
+      if (validConfigured.length > 0) {
+        lines.push("Configured (from agentDir):");
+        for (const d of validConfigured) {
+          lines.push(formatConfiguredAgentLine(d.name, d.def!, AGENT_NAMES.includes(d.name)));
+        }
+        lines.push("");
+      }
+
+      // Configured agents that failed to load — listed with reason, do not
+      // block other entries. acp_delegate still rejects these by name.
+      const invalidConfigured = discovered.filter((d) => !d.ok);
+      if (invalidConfigured.length > 0) {
+        lines.push("Invalid (configured but failed to load — acp_delegate rejects these):");
+        for (const d of invalidConfigured) {
+          lines.push(`  • ${d.name} [configured] INVALID: ${d.error}`);
+        }
+        lines.push("");
+      }
+
+      // Built-in agents not overridden by a valid configured file.
+      lines.push("Built-in:");
+      for (const name of AGENT_NAMES) {
+        if (configuredNames.has(name)) continue; // listed above as effective
+        const def = AGENTS[name];
+        if (!def) continue; // defensive: roster always has all names
+        lines.push(formatBuiltInAgentLine(name, def, false));
+      }
+      lines.push("");
+      lines.push("All agents run with freshContext=true (pi -p --no-session).");
+
+      return { details: undefined, content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  };
 }

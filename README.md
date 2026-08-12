@@ -107,6 +107,49 @@ The full delegate result is saved to a file (`/tmp/acp-delegate/<runId>.out`); t
 
 In the **interactive TUI**, async runs also show a live status widget below the editor (agent, elapsed seconds, task preview), so you always know what's running and for how long. Disabled automatically in RPC/print/JSON.
 
+### Configurable delegate agents (`agentDir`)
+
+Built-in roles cover the common cases, but you can add custom agents — or override built-ins — by pointing at a directory of Markdown agent files (opt-in):
+
+```json
+{
+  "delegate": true,
+  "agentDir": "~/.pi/agent"
+}
+```
+
+`agentDir` can also be set in `<project>/.pi/acp.json` (project overrides global). When unset, the five built-in roles behave exactly as documented above — the built-ins are always available as a fallback.
+
+Each `<name>.md` in the directory defines an agent; the filename is the agent name:
+
+```markdown
+---
+# provider/id override (optional)
+model: anthropic/claude-4.5
+# off|minimal|low|medium|high|xhigh|max (optional)
+thinking: high
+# allowlist; ACP tools auto-appended (optional)
+tools: read, bash, grep
+# seconds, positive int (optional)
+timeout: 30
+# per-call override allowlist (optional)
+allowed-models: anthropic/claude-4.5, openai/gpt-5
+---
+Your system prompt body. Appended to the task via --append-system-prompt.
+```
+
+Only `model`, `thinking`, `tools`, `timeout`, `allowed-models` are parsed — unknown keys are ignored, and pi-subagents concepts like `session-mode`, `mode`, or `auto-exit` are **not mapped** to `acp_delegate` behavior. The body is the agent's system prompt (appended, not replacing the task framing).
+
+Resolution precedence: **per-call `model`/`thinking`/`timeout` args > configured `.md` > built-in role > current context**. A configured file with the same name as a built-in overrides it; a configured file that exists but fails validation **fails closed** — `acp_delegate` returns the validation error instead of silently falling back to the built-in. `allowed-models` (plus the file's `model`) only **validates** a per-call `model` override; it is not an automatic fallback list.
+
+Child processes run fresh — `pi -p --no-session` (no parent context is inherited). If `tools` is declared it becomes a `--tools` allowlist with the ACP context tools (`compress, decompress, search_context, acp_status`) deduped and appended; if absent the child runs ambient on the full default toolset (like the built-in `worker`).
+
+`timeout` (per-call `timeout` arg wins over the file) bounds the child's runtime: async runs receive SIGTERM at the limit, then **SIGKILL after a 5s grace** if still alive; sync runs use the shorter of the effective timeout and the 5-minute safety ceiling. Timed-out runs are reported distinctly from cancelled and failed runs in the result and notification text.
+
+Preview before spawning with `dryRun:true` — it returns a sanitized plan (effective source, model, thinking, tools policy, timeout, and flag names) with **no prompt body, task content, env, or temp paths**. `acp_delegate_agents` lists all agents — built-in + configured + invalid (with its validation reason) — using the same sanitized summary format.
+
+**Security notes:** agent files are validated by name (`^[A-Za-z0-9_-]+$`, max 64 chars) and resolved with realpath containment — paths escaping the `agentDir` are rejected. Like the built-in roles, configured `tools` are a **soft guardrail, not a security boundary**: `bash` remains available and can bypass the allowlist.
+
 ## `/acp` command
 
 Rich status display for the user:
@@ -160,8 +203,9 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
 | `delegate` | `true` | Enable the `acp_delegate` tools (delegate/wait/cancel) and their system-prompt section. Set `false` to skip registering them (e.g. you use a different sub-agent extension, or run headless where async injection adds no value). |
 | `toolBashDefaultTimeout` | `60` | Seconds injected into the `bash` tool when the model omits `timeout`. Pi has **no** default of its own, so without this a forgotten timeout can hang for thousands of seconds. On timeout the model is guided to re-run with a larger `timeout`. `0` restores Pi's unbounded behavior. |
 | `toolOutputMaxBytes` | `200000` | Hard byte cap on tool result text (~5000 lines at ~40 B/line; applied via the `tool_result` hook). Stops runaway output that Pi's own 50KB/2000-line cap can't catch (e.g. tools Pi doesn't cap). When it fires the model is told how to see the full output — for `bash` the full output is in its temp file (`BashToolDetails.fullOutputPath`); set lower (e.g. `8192`) for a tighter context budget, or `0` to disable. |
+| `agentDir` | *(unset)* | Directory of Markdown agent files for custom/overriding `acp_delegate` roles — see [Configurable delegate agents](#configurable-delegate-agents-agentdir). Unset: built-in roles only. |
 
-> **Only these six keys are read from `acp.json`.** Other tuning knobs (`preserveRecentMessages`, `protectedTools`, nudge thresholds) are code-level and not user-overridable.
+> **Only these seven keys are read from `acp.json`.** Other tuning knobs (`preserveRecentMessages`, `protectedTools`, nudge thresholds) are code-level and not user-overridable.
 
 ### Environment variables
 

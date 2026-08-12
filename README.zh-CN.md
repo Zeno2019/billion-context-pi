@@ -106,6 +106,49 @@ Worker 运行在 Pi 的完整默认工具集上 - 不应用 `--tools` 白名单,
 
 在**交互 TUI** 中,异步运行还会在编辑器下方显示一个实时状态 widget(角色、已运行秒数、任务预览),让你随时知道什么在跑、跑了多久。RPC/print/JSON 模式自动禁用。
 
+### 可配置委派代理(`agentDir`)
+
+内置角色覆盖常见场景,但你也可以指向一个 Markdown 代理文件目录来添加自定义代理——或覆盖内置角色(opt-in):
+
+```json
+{
+  "delegate": true,
+  "agentDir": "~/.pi/agent"
+}
+```
+
+`agentDir` 也可在 `<项目>/.pi/acp.json` 中设置(项目级覆盖全局)。未设置时,五个内置角色的行为与上文所述完全一致——内置角色始终可用作回退。
+
+目录中的每个 `<name>.md` 定义一个代理,文件名即代理名:
+
+```markdown
+---
+# provider/id 覆盖(可选)
+model: anthropic/claude-4.5
+# off|minimal|low|medium|high|xhigh|max(可选)
+thinking: high
+# 白名单;ACP 工具自动追加(可选)
+tools: read, bash, grep
+# 秒,正整数(可选)
+timeout: 30
+# per-call 覆盖白名单(可选)
+allowed-models: anthropic/claude-4.5, openai/gpt-5
+---
+你的系统提示词正文。通过 --append-system-prompt 追加到任务。
+```
+
+只解析 `model`、`thinking`、`tools`、`timeout`、`allowed-models` —— 未知 key 被忽略,`session-mode`、`mode`、`auto-exit` 等 pi-subagents 概念**不会映射**到 `acp_delegate` 行为。正文是代理的系统提示词(追加,不替换任务框架)。
+
+解析优先级:**per-call `model`/`thinking`/`timeout` 参数 > 配置 `.md` > 内置角色 > 当前上下文**。与内置同名的配置文件覆盖内置;配置文件存在但校验失败时**fail-closed** —— `acp_delegate` 返回校验错误,而不是静默回退到内置。`allowed-models`(加上文件的 `model`)只**校验** per-call 的 `model` 覆盖;它不是自动 fallback 列表。
+
+子进程以全新上下文运行 —— `pi -p --no-session`(不继承父上下文)。声明 `tools` 时它会成为 `--tools` 白名单,并去重追加 ACP 上下文工具(`compress, decompress, search_context, acp_status`);未声明时子进程以完整默认工具集运行(同内置 `worker`)。
+
+`timeout`(per-call 的 `timeout` 参数优先于文件)限制子进程运行时长:异步运行在到达上限时收到 SIGTERM,若仍在运行则 **5 秒宽限期后 SIGKILL**;同步运行取有效超时与 5 分钟安全上限的较小值。超时运行在结果与通知文案中与已取消(cancelled)、失败(failed)明确区分。
+
+spawn 前可用 `dryRun:true` 预览 —— 返回脱敏计划(有效 source、model、thinking、tools 策略、timeout、flag 名),**不含提示词正文、任务内容、环境变量或临时路径**。`acp_delegate_agents` 列出所有代理 —— 内置 + 已配置 + 无效(附校验原因)—— 使用同样的脱敏摘要格式。
+
+**安全说明:** 代理文件按名称校验(`^[A-Za-z0-9_-]+$`,最长 64 字符),并通过 realpath containment 解析 —— 逃出 `agentDir` 的路径被拒绝。与内置角色一样,配置的 `tools` 是**软护栏,不是安全边界**:`bash` 仍然可用,可以绕过白名单。
+
 ## `/acp` 命令
 
 为用户提供丰富的状态显示:
@@ -159,8 +202,9 @@ billion-context-pi 开箱即用,无需任何配置。可以在 JSON 配置文件
 | `delegate` | `true` | 启用 `acp_delegate` 工具(delegate/wait/cancel)及其系统提示词段落。设为 `false` 则不注册这些工具(例如你用了别的子代理扩展,或跑 headless 场景异步注入没有意义)。 |
 | `toolBashDefaultTimeout` | `60` | 当模型未指定 `timeout` 时注入 `bash` 工具的超时秒数。Pi **本身没有默认超时**,不加这个,一次遗漏的超时可能挂起几千秒。超时后会提示模型用更大的 `timeout` 重跑。设为 `0` 恢复 Pi 的无界行为。 |
 | `toolOutputMaxBytes` | `200000` | 工具结果文本硬上限(字节,约 5000 行 @ ~40 字节/行,通过 `tool_result` hook 应用)。用于兜住 Pi 自身 50KB/2000 行截断管不到的输出(例如 Pi 未加限制的工具)。触发截断时会告诉模型如何查看完整输出——对 `bash`,完整输出在其临时文件(`BashToolDetails.fullOutputPath`)中;设更小(如 `8192`)可更省上下文,设 `0` 关闭。 |
+| `agentDir` | *(未设置)* | Markdown 代理文件目录,用于自定义/覆盖 `acp_delegate` 角色——见 [可配置委派代理](#可配置委派代理agentdir)。未设置:仅内置角色。 |
 
-> **只有这六个 key 会被 `acp.json` 读取。** 其他调优参数(`preserveRecentMessages`、`protectedTools`、nudge 阈值)是代码级的,不向用户开放。
+> **只有这七个 key 会被 `acp.json` 读取。** 其他调优参数(`preserveRecentMessages`、`protectedTools`、nudge 阈值)是代码级的,不向用户开放。
 
 ### 环境变量
 
