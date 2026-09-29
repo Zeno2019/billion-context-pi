@@ -127,6 +127,7 @@ All keys below are currently **ACTIVE**.
 | `outputHeadroomMaxPct` | number \| string | `0.25` | 🟢 ACTIVE | Cap on the output-headroom reservation, as a fraction of the context window. |
 | `toolBashDefaultTimeout` | number | `60` | 🟢 ACTIVE | Default `bash` tool timeout in seconds when the model omits it. |
 | `toolOutputMaxBytes` | number | `50000` | 🟢 ACTIVE | Hard byte cap on tool result text. |
+| `agentDir` | string | *(unset)* | 🟢 ACTIVE | Directory of Markdown agent files for custom or overriding `acp_delegate` roles. |
 | `protectedTools` | string\[\] | `none` | 🟢 ACTIVE | Tool-name patterns (glob suffix allowed) whose **every** call+result pair is hard-excluded from compression (refs render `BLOCKED`). For low-frequency, high-value tools with independent outputs — see the ⚠ note below. |
 | `protectedLatestTools` | string\[\] | `none` | 🟢 ACTIVE | Tool-name patterns (glob suffix allowed) whose **latest** call+result pair is hard-excluded from compression; older pairs remain compressible. For cumulative-snapshot tools. |
 | `neverPreserveRecentTools` | string\[\] | kernel built-in (`["decompress", "search_context", "read", "bash"]`, acp-kernel >= 0.0.92) | 🟢 ACTIVE | Tool-name patterns **removed from** the soft-protected recent zone so their results fold immediately. Default keeps `read`/`bash` compressible; remove only `read` (keep `decompress`/`search_context`) to stop the batch-read fold→re-read loop. **Empty array `[]` is valid** (max-protection escape hatch). |
@@ -304,6 +305,15 @@ All keys below are currently **ACTIVE**.
   ```
 
   without restating (or freezing a stale hand-copy of) the built-in list, and it keeps following built-in evolution. Composable with an explicit `neverPreserveRecentTools` (subtraction applies to the explicit list too); glob-suffix patterns subtract matching entries (`"bash*"` removes `bash`). **⚠ Empty array `[]` is INVALID** here — it is a pure no-op, so a bare `[]` is almost certainly a typo for `neverPreserveRecentTools: []` (the max-protection escape hatch); malformed values warn and fall back to the adapter value.
+
+---
+
+### `agentDir`
+
+- **Type:** `string`
+- **Default:** *(unset)*
+- **Status:** 🟢 ACTIVE
+- **Description:** Directory containing one `<name>.md` file per agent. When set, `acp_delegate` loads these definitions alongside the built-in roles; matching names override built-ins. Supports `~` expansion. See [Configurable delegate agents](./README.md#configurable-delegate-agents-agentdir) for frontmatter, resolution precedence, `dryRun`, and the `acp_delegate_agents` discovery tool.
 
 ---
 

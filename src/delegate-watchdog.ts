@@ -6,6 +6,9 @@ export interface WatchdogOptions {
   idleMs?: number | null;
   /** Hard time limit. 0/null disables the limit timer. */
   timeoutMs?: number | null;
+  /** Optional label for the hard-limit kill reason (e.g. "45s limit" for a
+   *  per-agent-file timeout). Defaults to "${timeoutMs / 60_000}m limit". */
+  timeoutReason?: string;
   killGraceMs: number;
 }
 
@@ -103,7 +106,10 @@ export function attachWatchdogs(
 
   poke();
   if (timeoutMs > 0) {
-    timeoutTimer = setTimeout(() => killByWatchdog(`${timeoutMs / 60_000}m limit`), timeoutMs);
+    timeoutTimer = setTimeout(
+      () => killByWatchdog(opts.timeoutReason ?? `${timeoutMs / 60_000}m limit`),
+      timeoutMs,
+    );
     timeoutTimer.unref?.();
   }
 

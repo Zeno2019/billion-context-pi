@@ -163,6 +163,51 @@ Worker 运行在 Pi 的完整默认工具集上 - 不应用 `--tools` 白名单,
 
 在**交互 TUI** 中,异步运行还会在编辑器下方显示一个实时状态 widget(角色、已运行秒数、任务预览),让你随时知道什么在跑、跑了多久。RPC/print/JSON 模式自动禁用。
 
+### 可配置委派代理(`agentDir`)
+
+内置角色覆盖常见场景,但你也可以指向一个 Markdown 代理文件目录来添加自定义代理——或覆盖内置角色(opt-in):
+
+```json
+{
+  "delegate": true,
+  "agentDir": "~/.pi/agent/agents"
+}
+```
+
+`agentDir` 也可在 `<项目>/.pi/acp.json` 中设置(项目级覆盖全局)。未设置时,内置角色的行为与上文所述完全一致——内置角色始终可用作回退。
+
+目录中的每个 `<name>.md` 定义一个代理,文件名即代理名:
+
+```markdown
+---
+# provider/id 覆盖(可选)
+model: anthropic/claude-4.5
+# off|minimal|low|medium|high|xhigh|max(可选)
+thinking: high
+# 白名单;ACP 工具自动追加(可选)
+tools: read, bash, grep
+# 秒,正整数(可选)
+timeout: 30
+# per-call 覆盖白名单(可选)
+allowed-models: anthropic/claude-4.5, openai/gpt-5
+---
+你的系统提示词正文。通过 --append-system-prompt 追加到任务。
+```
+
+只解析 `model`、`thinking`、`tools`、`timeout`、`allowed-models` —— 未知 key 被忽略,`session-mode`、`mode`、`auto-exit` 等 pi-subagents 概念**不会映射**到 `acp_delegate` 行为。正文是代理的系统提示词(追加,不替换任务框架)。
+
+解析优先级:**per-call `model`/`thinkingLevel`/`timeoutMinutes` 参数 > 代理文件 > `delegate.agents.<role>` 配置 > 继承父上下文**。代理文件的 `model`/`thinking` 与 `delegate.agents` 走同一条按角色解析链,并在同名角色上优先于后者。与内置同名的配置文件覆盖内置;配置文件存在但校验失败时**fail-closed** —— `acp_delegate` 返回校验错误,而不是静默回退到内置。`allowed-models`(加上文件的 `model`)只**校验** per-call 的 `model` 覆盖;它不是自动 fallback 列表。
+
+代理文件的 `model` 原样透传(可以指向自定义、非目录内模型);只有 `delegate.agents.<role>.model` 会对照实时模型注册表校验——查无此模型时回退父模型并记录告警,不会硬失败。
+
+子进程在独立 pi 进程中以全新上下文运行(pi 宿主使用每次运行独立的 session 文件,失败可 resume;omp 保持 `--no-session`)。声明 `tools` 时它会成为 `--tools` 白名单,并去重追加 ACP 上下文工具(`compress, decompress, search_context, acp_status`);未声明时子进程以完整默认工具集运行(同内置 `worker`)。
+
+`timeout`(per-call 的 `timeoutMinutes` 参数优先于文件)限制子进程运行时长——只会缩短配置上限,绝不延长:异步运行在到达上限时收到 SIGTERM,若仍在运行则 **约 10 秒宽限期后 SIGKILL**;同步运行取有效超时与 5 分钟安全上限的较小值。超时运行在结果与通知文案中与已取消(cancelled)、失败(failed)明确区分。
+
+spawn 前可用 `dryRun:true` 预览 —— 返回脱敏计划(有效 source、model、thinking、tools 策略、timeout、flag 名),**不含提示词正文、任务内容、环境变量或临时路径**。`acp_delegate_agents` 列出所有代理 —— 内置 + 已配置 + 无效(附校验原因)—— 使用同样的脱敏摘要格式。
+
+**安全说明:** 代理文件按名称校验(`^[A-Za-z0-9_-]+$`,最长 64 字符),并通过 realpath containment 解析 —— 逃出 `agentDir` 的路径被拒绝。与内置角色一样,配置的 `tools` 是**软护栏,不是安全边界**:`bash` 仍然可用,可以绕过白名单。
+
 #### 改用你自己的子代理
 
 如果你已经在用别的子代理扩展(pi-subagents、pi-lens 等),关掉 ACP 的 delegate,让模型只有一条委派路径。在 `~/.pi/acp.json`(全局)或 `<项目>/.pi/acp.json`(项目级):

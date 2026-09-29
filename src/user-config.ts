@@ -39,6 +39,7 @@ export interface UserAcpConfig {
   delegatePrompt?: string | null;
   hostSession?: boolean | HostSessionConfig;
   rules?: boolean;
+  agentDir?: string;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -145,13 +146,18 @@ const KNOWN = new Set([
   "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
   "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
-  "hostSession", "rules",
+  "hostSession", "rules", "agentDir",
 ]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
   const out: UserAcpConfig = {};
   for (const [k, v] of Object.entries(parsed)) {
-    if (KNOWN.has(k)) (out as Record<string, unknown>)[k] = v;
+    if (!KNOWN.has(k)) continue;
+    if (k === "agentDir") {
+      if (typeof v === "string" && v.trim().length > 0) out.agentDir = v.trim();
+      continue;
+    }
+    (out as Record<string, unknown>)[k] = v;
   }
   return out;
 }
@@ -167,6 +173,8 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
     ...user,
     coreOverrides: adapter.coreOverrides,
     preserveRecentMessages: adapter.preserveRecentMessages,
+    // agentDir from user config overrides factory; if neither sets it, stays
+    // undefined and built-in-only behavior is preserved (opt-in).
   };
   for (const key of ["protectedTools", "protectedLatestTools"] as const) {
     if (!(key in user)) continue;

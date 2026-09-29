@@ -20,7 +20,7 @@ import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
 import { makeCacheTool } from "./cache-tool.js";
 import { makeRuleTool } from "./rule-tool.js";
-import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
+import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, makeDelegateAgentsTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
@@ -321,9 +321,10 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     }
     const delegatePolicy = resolveDelegate(runtime.adapter);
     if (delegatePolicy.enabled && !runtime.delegateStoodDown) {
-      pi.registerTool(makeDelegateTool(pi));
+      pi.registerTool(makeDelegateTool(pi, runtime.adapter.agentDir));
       pi.registerTool(makeDelegateWaitTool(pi));
       pi.registerTool(makeDelegateCancelTool(pi));
+      pi.registerTool(makeDelegateAgentsTool(runtime.adapter.agentDir));
       // Not every host implements the full ExtensionAPI surface (older pi,
       // embedded hosts) — shortcuts are a TUI nicety, never load-bearing.
       if (typeof pi.registerShortcut === "function" && delegatePolicy.fleetShortcut !== "") {

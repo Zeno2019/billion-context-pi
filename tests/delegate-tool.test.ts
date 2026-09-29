@@ -1,12 +1,14 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, makeDelegateAgentsTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** Minimal ctx mock - buildChildArgs reads ctx.model and sessionManager. */
 function mockCtx(host: "pi" | "omp" = "pi"): ExtensionContext {
@@ -15,6 +17,21 @@ function mockCtx(host: "pi" | "omp" = "pi"): ExtensionContext {
       ? { buildContextEntries: () => [] }
       : { getBranch: () => [] };
   return { model: { provider: "test", id: "test-model" }, sessionManager } as unknown as ExtensionContext;
+}
+
+/** Minimal ctx mock for the dryRun path: needs mode/cwd/model/sessionManager. */
+function mockDryRunCtx(): ExtensionContext {
+  return {
+    mode: "print",
+    cwd: process.cwd(),
+    model: { provider: "test", id: "test-model" },
+    sessionManager: { buildContextEntries: () => [] },
+  } as unknown as ExtensionContext;
+}
+
+/** Minimal pi mock - the dryRun path never calls sendUserMessage. */
+function mockPi(): ExtensionAPI {
+  return { sendUserMessage: () => {} } as unknown as ExtensionAPI;
 }
 
 const RESTRICTED_ROLES = ["reviewer", "researcher", "planner", "oracle"] as const;
@@ -391,6 +408,410 @@ test("buildChildArgs keeps -p for sync delegates even on pi", async () => {
   assert.equal(cliArgs[0], "-p");
 });
 
+// ─── Configured-agent resolution precedence (dryRun chain) ─────────────────
+// These tests drive the full resolution path (resolveAgent -> runDelegate ->
+// planDryRun) through the public tool API with dryRun:true - no spawn, no
+// temp dirs, no side effects. A real agentDir fixture is required so the
+// resolver sees actual .md files.
+
+const fixtureDirs: string[] = [];
+
+async function makeAgentDir(): Promise<string> {
+  const dir = await mkdtemp(join(process.cwd(), ".delegate-tool-test-agentdir-"));
+  fixtureDirs.push(dir);
+  return dir;
+}
+
+async function writeAgentMd(dir: string, fileName: string, content: string): Promise<void> {
+  await writeFile(join(dir, fileName), content, "utf8");
+}
+
+/** Run a dryRun acp_delegate call and return the tool text result. */
+async function dryRunPlan(
+  agentDir: string | undefined,
+  params: {
+    agent: string;
+    task: string;
+    cwd?: string;
+    model?: string;
+    thinkingLevel?: string;
+    async?: boolean;
+    dryRun?: boolean;
+    timeoutMinutes?: number;
+  },
+): Promise<string> {
+  const tool = makeDelegateTool(mockPi(), agentDir);
+  const res = await tool.execute("dry", params, undefined, undefined, mockDryRunCtx());
+  const content = res.content[0];
+  const text = content && "text" in content ? content.text : "";
+  return text;
+}
+
+const CONFIGURED_REVIEWER_MD = `---
+name: reviewer
+model: anthropic/claude-4.5
+thinking: high
+tools: read
+allowed-models: openai/gpt-5, anthropic/claude-4.5
+timeout: 30
+---
+Configured reviewer prompt.
+`;
+
+after(async () => {
+  for (const dir of fixtureDirs) {
+    await rm(dir, { recursive: true, force: true });
+  }
+  // Remove result files persisted by async delegate tests (persistResult
+  // writes into tmpdir()/acp-delegate). Best-effort - the sandbox may block.
+  try {
+    const files = await readdir(OUT_DIR);
+    for (const f of files.filter((f) => f.startsWith("del_"))) {
+      await rm(join(OUT_DIR, f), { force: true });
+    }
+  } catch {
+    // directory absent or unremovable - fine
+  }
+  // Remove buildChildArgs temp dirs. runDelegate's cleanupTmp is fire-and-
+  // forget (may not finish before the test ends) and the direct buildChildArgs
+  // tests never clean up - every acp-delegate-* dir in tmpdir() is owned
+  // exclusively by this test file.
+  try {
+    const entries = await readdir(tmpdir());
+    for (const e of entries.filter((e) => e.startsWith("acp-delegate-"))) {
+      await rm(join(tmpdir(), e), { recursive: true, force: true });
+    }
+  } catch {
+    // unreadable tmpdir - fine
+  }
+});
+
+test("configured same-name agent overrides built-in (dryRun shows configured source)", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+
+  const plan = await dryRunPlan(dir, { agent: "reviewer", task: "x", dryRun: true });
+  assert.ok(plan.includes("- source: configured (from agentDir)"), `configured source: ${plan}`);
+  assert.ok(plan.includes("- model: anthropic/claude-4.5 (agent file)"), `md model: ${plan}`);
+  assert.ok(plan.includes("- thinking: high"), `md thinking: ${plan}`);
+  assert.ok(plan.includes("- timeout: 30s"), `md timeout: ${plan}`);
+  assert.ok(plan.includes("read, compress, decompress, search_context, acp_status (--tools allowlist)"), `md tools + ACP: ${plan}`);
+});
+
+test("per-call model/thinking/timeout override the configured md", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+
+  const plan = await dryRunPlan(dir, {
+    agent: "reviewer",
+    task: "x",
+    dryRun: true,
+    model: "openai/gpt-5",
+    thinkingLevel: "low",
+    timeoutMinutes: 7,
+  });
+  assert.ok(plan.includes("- model: openai/gpt-5 (per-call override)"), `per-call model: ${plan}`);
+  assert.ok(plan.includes("- thinking: low"), `per-call thinking: ${plan}`);
+  assert.ok(plan.includes("- timeout: 7m (per-call override)"), `per-call timeout: ${plan}`);
+});
+
+test("configured allowed-models accepts an in-list per-call model override", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+
+  const plan = await dryRunPlan(dir, {
+    agent: "reviewer",
+    task: "x",
+    dryRun: true,
+    model: "openai/gpt-5",
+  });
+  assert.ok(plan.includes("- model: openai/gpt-5 (per-call override)"), `in-list override accepted: ${plan}`);
+});
+
+test("configured allowed-models rejects an out-of-list override (not auto-fallback)", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+
+  const plan = await dryRunPlan(dir, {
+    agent: "reviewer",
+    task: "x",
+    dryRun: true,
+    model: "google/gemini-3",
+  });
+  assert.ok(plan.includes("not in the allowed set"), `rejection message: ${plan}`);
+  assert.ok(!plan.includes("source:"), "must NOT silently fall back to another model/source");
+});
+
+test("malformed same-name definition fails closed without falling back to built-in", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", "---\nthinking: turbo\n---\nbody\n");
+
+  const plan = await dryRunPlan(dir, { agent: "reviewer", task: "x", dryRun: true });
+  assert.ok(plan.includes("failed to load"), `fail-closed message: ${plan}`);
+  assert.ok(plan.includes('invalid thinking level "turbo"'), `reason surfaced: ${plan}`);
+  assert.ok(!plan.includes("- source: built-in"), "must NOT fall back to the built-in reviewer");
+  assert.ok(!plan.includes("You are a senior code reviewer"), "must NOT emit the built-in prompt");
+});
+
+test("built-in fallback applies when the same-name configured file is absent", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "custom-only.md", CONFIGURED_REVIEWER_MD); // only a custom agent
+
+  const plan = await dryRunPlan(dir, { agent: "reviewer", task: "x", dryRun: true });
+  assert.ok(plan.includes("- source: built-in"), `built-in fallback: ${plan}`);
+  assert.ok(plan.includes("read, bash, grep, find, ls, compress, decompress, search_context, acp_status (--tools allowlist)"), `built-in restricted tools + ACP: ${plan}`);
+});
+
+// ─── Configured agent -> child args mapping (buildChildArgs with resolved) ──
+
+test("buildChildArgs maps configured tools and dedupes the ACP append", async () => {
+  const { cliArgs } = await buildChildArgs(
+    { agent: "custom", task: "t" },
+    "custom prompt",
+    mockCtx(),
+    "test-run",
+    {
+      name: "custom",
+      source: "configured",
+      prompt: "custom prompt",
+      tools: ["read", "compress", "grep"], // compress already present: must not duplicate
+    },
+  );
+  const toolsStr = getToolsValue(cliArgs);
+  assert.equal(
+    toolsStr,
+    "read,compress,grep,decompress,search_context,acp_status",
+    "configured tools first, ACP tools appended without duplicates",
+  );
+});
+
+test("buildChildArgs maps configured model and thinking", async () => {
+  const { cliArgs } = await buildChildArgs(
+    { agent: "custom", task: "t" },
+    "custom prompt",
+    mockCtx(),
+    "test-run",
+    {
+      name: "custom",
+      source: "configured",
+      prompt: "custom prompt",
+      model: "anthropic/claude-4.5",
+      thinking: "high",
+    },
+  );
+  const providerIdx = cliArgs.indexOf("--provider");
+  const modelIdx = cliArgs.indexOf("--model");
+  assert.ok(providerIdx >= 0, "--provider present from configured model");
+  assert.equal(cliArgs[providerIdx + 1], "anthropic");
+  assert.ok(modelIdx >= 0, "--model present from configured model");
+  assert.equal(cliArgs[modelIdx + 1], "claude-4.5");
+  const thinkingIdx = cliArgs.indexOf("--thinking");
+  assert.ok(thinkingIdx >= 0, "--thinking present from configured thinking");
+  assert.equal(cliArgs[thinkingIdx + 1], "high");
+});
+
+test("buildChildArgs per-call model beats the configured md model", async () => {
+  const { cliArgs } = await buildChildArgs(
+    { agent: "custom", task: "t", model: "openai/gpt-5" },
+    "custom prompt",
+    mockCtx(),
+    "test-run",
+    {
+      name: "custom",
+      source: "configured",
+      prompt: "custom prompt",
+      model: "anthropic/claude-4.5",
+    },
+  );
+  const providerIdx = cliArgs.indexOf("--provider");
+  const modelIdx = cliArgs.indexOf("--model");
+  assert.ok(providerIdx >= 0);
+  assert.equal(cliArgs[providerIdx + 1], "openai", "per-call provider wins");
+  assert.ok(modelIdx >= 0);
+  assert.equal(cliArgs[modelIdx + 1], "gpt-5", "per-call model wins");
+});
+
+test("buildChildArgs configured agent without tools gets no --tools (ambient)", async () => {
+  const { cliArgs } = await buildChildArgs(
+    { agent: "custom", task: "t" },
+    "custom prompt",
+    mockCtx(),
+    "test-run",
+    { name: "custom", source: "configured", prompt: "custom prompt" },
+  );
+  assert.equal(getToolsValue(cliArgs), null, "no --tools for unrestricted configured agent");
+});
+
+// ─── dryRun: zero side effects + sanitized output ───────────────────────────
+// OUT_DIR (persistResult's target) is join(tmpdir(), "acp-delegate"). A dryRun
+// that spawned or persisted would show up as a new file there (or a runId /
+// "Delegated to" in the result).
+
+const OUT_DIR = join(tmpdir(), "acp-delegate");
+
+async function outDirFiles(): Promise<string[]> {
+  try {
+    return (await readdir(OUT_DIR)).sort();
+  } catch {
+    return []; // directory may not exist yet
+  }
+}
+
+test("dryRun does not spawn, register a run, or persist a result file", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+  const before = await outDirFiles();
+
+  const plan = await dryRunPlan(dir, { agent: "reviewer", task: "x", dryRun: true });
+
+  assert.ok(plan.includes("DryRun plan"), "returns a plan, not a run notification");
+  assert.ok(!plan.includes("del_"), "no runId was created");
+  assert.ok(!plan.includes("Delegated to"), "did not take the async delegation path");
+  assert.deepEqual(await outDirFiles(), before, "no result file was persisted");
+});
+
+test("dryRun plan shows effective fields but no prompt body or task content", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(
+    dir,
+    "reviewer.md",
+    CONFIGURED_REVIEWER_MD.replace("Configured reviewer prompt.", "CONFIDENTIAL_PROMPT_MARKER body."),
+  );
+
+  const plan = await dryRunPlan(dir, {
+    agent: "reviewer",
+    task: "handle task-sensitive-payload-marker",
+    dryRun: true,
+  });
+
+  // Effective plan fields are present.
+  assert.ok(plan.includes("- source: configured (from agentDir)"), "source shown");
+  assert.ok(plan.includes("- model: anthropic/claude-4.5 (agent file)"), "model shown");
+  assert.ok(plan.includes("- thinking: high"), "thinking shown");
+  assert.ok(plan.includes("--tools allowlist"), "tools policy shown");
+  assert.ok(plan.includes("- timeout: 30s"), "timeout shown");
+  assert.ok(plan.includes("- mode: sync (print)"), "mode shown (mock ctx is print mode)");
+
+  // No body prompt, no task content, no full argv values.
+  assert.ok(!plan.includes("CONFIDENTIAL_PROMPT_MARKER"), "agent body prompt must not leak");
+  assert.ok(!plan.includes("task-sensitive-payload-marker"), "task content must not leak");
+});
+
+test("dryRun plan lists only flag names, never env, temp paths, or argv values", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD);
+
+  const plan = await dryRunPlan(dir, { agent: "reviewer", task: "x", dryRun: true });
+
+  // Exact flag line: names only, no values (esp. no --append-system-prompt file path).
+  // The mock ctx is a pi host, so a run-scoped session file stands in for --no-session.
+  assert.ok(
+    plan.includes("- CLI flags: -p, --session, <run-scoped>, --session-dir, <out-dir>, --append-system-prompt, --tools, --provider, --model, --thinking"),
+    `exact flag names line: ${plan}`,
+  );
+  assert.ok(!plan.includes("role.md"), "no temp prompt file path");
+  assert.ok(!plan.includes("PATH="), "no environment variables");
+  assert.ok(!plan.includes("acp-delegate-"), "no temp dir fragments");
+  assert.ok(!plan.includes("process.env"), "no env access pattern");
+});
+
+// ─── acp_delegate_agents: discovery + sanitization ─────────────────────────
+
+async function listAgents(agentDir: string | undefined): Promise<string> {
+  const tool = makeDelegateAgentsTool(agentDir);
+  const res = await tool.execute("list", {}, undefined, undefined, mockDryRunCtx());
+  const content = res.content[0];
+  return content && "text" in content ? content.text : "";
+}
+
+test("acp_delegate_agents without agentDir lists only built-ins", async () => {
+  const out = await listAgents(undefined);
+
+  for (const name of ["reviewer", "researcher", "worker", "planner", "oracle"]) {
+    assert.ok(out.includes(`${name} [built-in]`), `built-in ${name} listed`);
+  }
+  assert.ok(!out.includes("Configured (from agentDir)"), "no configured section when agentDir absent");
+  assert.ok(!out.includes("Invalid ("), "no invalid section when agentDir absent");
+});
+
+test("acp_delegate_agents with agentDir lists override, custom, and invalid entries", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "reviewer.md", CONFIGURED_REVIEWER_MD); // same-name override
+  await writeAgentMd(dir, "custom-agent.md", "---\nmodel: openai/gpt-5\ntimeout: 60\n---\ncustom body\n");
+  await writeAgentMd(dir, "broken.md", "---\nthinking: nope\n---\nbody\n");
+
+  const out = await listAgents(dir);
+
+  // Same-name configured is effective, with the built-in noted as available.
+  assert.ok(out.includes("reviewer [configured]"), "configured reviewer is effective");
+  assert.ok(out.includes("(built-in also available)"), "built-in availability noted");
+  assert.ok(out.includes("custom-agent [configured]"), "custom agent listed");
+  assert.ok(out.includes("broken [configured] INVALID: invalid thinking level \"nope\""), "invalid entry with controlled reason");
+
+  // Built-in section lists the remaining roles but NOT the overridden one.
+  assert.ok(out.includes("researcher [built-in]"), "researcher still listed");
+  assert.ok(out.includes("worker [built-in]"), "worker still listed");
+  assert.ok(out.includes("planner [built-in]"), "planner still listed");
+  assert.ok(out.includes("oracle [built-in]"), "oracle still listed");
+  assert.ok(!out.includes("reviewer [built-in]"), "overridden reviewer absent from built-in list");
+});
+
+test("acp_delegate_agents output is sanitized (no body, env, unknown fields, or absolute paths)", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(
+    dir,
+    "reviewer.md",
+    [
+      "---",
+      "name: reviewer",
+      "model: anthropic/claude-4.5",
+      "unknownfield: should-not-leak-value",
+      "allowed-models: anthropic/claude-4.5",
+      "---",
+      "LIST_BODY_MARKER=xyz",
+      "",
+    ].join("\n"),
+  );
+
+  const out = await listAgents(dir);
+
+  assert.ok(!out.includes("LIST_BODY_MARKER"), "no markdown body content");
+  assert.ok(!out.includes("should-not-leak-value"), "no unknown-field values");
+  assert.ok(!out.includes("unknownfield"), "no unknown frontmatter keys");
+  assert.ok(!out.includes(dir), "no absolute agentDir path");
+  assert.ok(!out.includes("PATH="), "no environment variables");
+});
+
+test("acp_delegate_agents invalid entries expose only controlled reasons, not file contents", async () => {
+  const dir = await makeAgentDir();
+  await writeAgentMd(dir, "broken.md", "---\nthinking: nope\n---\nRAWDATA_LEAK=1\n");
+
+  const out = await listAgents(dir);
+
+  assert.ok(out.includes("broken [configured] INVALID: invalid thinking level \"nope\""), "controlled reason shown");
+  assert.ok(!out.includes("RAWDATA_LEAK"), "raw file content must not leak");
+});
+
+test("unconfigured agentDir: built-in restricted roles keep source + allowlist in dryRun", async () => {
+  for (const role of RESTRICTED_ROLES) {
+    const plan = await dryRunPlan(undefined, { agent: role, task: "x", dryRun: true });
+    assert.ok(plan.includes("- source: built-in"), `${role}: resolves as built-in`);
+    assert.ok(
+      plan.includes("read, bash, grep, find, ls, compress, decompress, search_context, acp_status (--tools allowlist)"),
+      `${role}: restricted base + ACP allowlist`,
+    );
+    assert.ok(!plan.includes("edit"), `${role}: no edit tool`);
+    assert.ok(!plan.includes("write"), `${role}: no write tool`);
+  }
+  const workerPlan = await dryRunPlan(undefined, { agent: "worker", task: "x", dryRun: true });
+  assert.ok(
+    workerPlan.includes("ambient (full default toolset, no --tools restriction)"),
+    "worker stays ambient (no allowlist)",
+  );
+});
+
+// ─── usage reporting ───────────────────────────────────────────────────────
+
 test("buildWaitResult returns usage in merged mode", () => {
   resetDelegateUsage();
   const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } } };
@@ -527,9 +948,9 @@ test("resolveWaitTimeoutMs passes through values >= 1000 as ms, clamped to [1000
   assert.equal(resolveWaitTimeoutMs(500_000), 300_000);
 });
 
-test("resolveWaitTimeoutMs boundary: 999 → 300000 (seconds→clamp), 0/negative → 1000 floor", () => {
-  // The <1000 → seconds rescale means 999 becomes 999000 then clamps to the
-  // 300000 max — a sharp edge at the 999/1000 boundary, documented here.
+test("resolveWaitTimeoutMs boundary: 999 -> 300000 (seconds->clamp), 0/negative -> 1000 floor", () => {
+  // The <1000 -> seconds rescale means 999 becomes 999000 then clamps to the
+  // 300000 max - a sharp edge at the 999/1000 boundary, documented here.
   assert.equal(resolveWaitTimeoutMs(999), 300_000);
   assert.equal(resolveWaitTimeoutMs(0), 1_000);
   assert.equal(resolveWaitTimeoutMs(-5), 1_000);

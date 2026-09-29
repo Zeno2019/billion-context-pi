@@ -176,6 +176,51 @@ The full delegate result is saved to a file (`$TMPDIR/acp-delegate/<runId>.out`,
 
 In the **interactive TUI**, async runs also show a live status widget below the editor (agent, elapsed seconds, task preview), so you always know what's running and for how long. Disabled automatically in RPC/print/JSON.
 
+### Configurable delegate agents (`agentDir`)
+
+Built-in roles cover the common cases, but you can add custom agents — or override built-ins — by pointing at a directory of Markdown agent files (opt-in):
+
+```json
+{
+  "delegate": true,
+  "agentDir": "~/.pi/agent/agents"
+}
+```
+
+`agentDir` can also be set in `<project>/.pi/acp.json` (project overrides global). When unset, the built-in roles behave exactly as documented above — the built-ins are always available as a fallback.
+
+Each `<name>.md` in the directory defines an agent; the filename is the agent name:
+
+```markdown
+---
+# provider/id override (optional)
+model: anthropic/claude-4.5
+# off|minimal|low|medium|high|xhigh|max (optional)
+thinking: high
+# allowlist; ACP tools auto-appended (optional)
+tools: read, bash, grep
+# seconds, positive int (optional)
+timeout: 30
+# per-call override allowlist (optional)
+allowed-models: anthropic/claude-4.5, openai/gpt-5
+---
+Your system prompt body. Appended to the task via --append-system-prompt.
+```
+
+Only `model`, `thinking`, `tools`, `timeout`, `allowed-models` are parsed — unknown keys are ignored, and pi-subagents concepts like `session-mode`, `mode`, or `auto-exit` are **not mapped** to `acp_delegate` behavior. The body is the agent's system prompt (appended, not replacing the task framing).
+
+Resolution precedence: **per-call `model`/`thinkingLevel`/`timeoutMinutes` args > agent file > `delegate.agents.<role>` config > inherit parent**. A configured file's `model`/`thinking` feed the same per-role resolution chain as `delegate.agents` and win over it for that role's name. A configured file with the same name as a built-in overrides it; a configured file that exists but fails validation **fails closed** — `acp_delegate` returns the validation error instead of silently falling back to the built-in. `allowed-models` (plus the file's `model`) only **validates** a per-call `model` override; it is not an automatic fallback list.
+
+A file's `model` is passed through untouched (it may name a custom, non-catalog model); only `delegate.agents.<role>.model` values are checked against the live model registry — an unknown one falls back to the parent model with a log warning, never a hard failure.
+
+Child processes run fresh in their own pi process (pi hosts use a per-run session file so failed runs can be resumed; omp keeps `--no-session`). If `tools` is declared it becomes a `--tools` allowlist with the ACP context tools (`compress, decompress, search_context, acp_status`) deduped and appended; if absent the child runs ambient on the full default toolset (like the built-in `worker`).
+
+`timeout` (the per-call `timeoutMinutes` arg wins over the file) caps the child's runtime — it only ever shortens the configured limit, never extends it: async runs receive SIGTERM at the limit, then **SIGKILL after a ~10s grace** if still alive; sync runs use the shorter of the effective timeout and the 5-minute safety ceiling. Timed-out runs are reported distinctly from cancelled and failed runs in the result and notification text.
+
+Preview before spawning with `dryRun:true` — it returns a sanitized plan (effective source, model, thinking, tools policy, timeout, and flag names) with **no prompt body, task content, env, or temp paths**. `acp_delegate_agents` lists all agents — built-in + configured + invalid (with its validation reason) — using the same sanitized summary format.
+
+**Security notes:** agent files are validated by name (`^[A-Za-z0-9_-]+$`, max 64 chars) and resolved with realpath containment — paths escaping the `agentDir` are rejected. Like the built-in roles, configured `tools` are a **soft guardrail, not a security boundary**: `bash` remains available and can bypass the allowlist.
+
 #### Using your own sub-agent instead
 
 If you already run another sub-agent extension (pi-subagents, pi-lens, …), turn ACP's delegate off so the model is offered only one way to delegate. In `~/.pi/acp.json` (global) or `<project>/.pi/acp.json` (per project):

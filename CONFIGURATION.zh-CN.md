@@ -126,6 +126,7 @@
 | `outputHeadroomMaxPct` | number \| string | `0.25` | 🟢 ACTIVE | 输出预留（output headroom）占上下文窗口的比例上限。 |
 | `toolBashDefaultTimeout` | number | `60` | 🟢 ACTIVE | 模型省略 `timeout` 时注入 bash 工具的默认超时秒数。 |
 | `toolOutputMaxBytes` | number | `50000` | 🟢 ACTIVE | 工具返回文本的硬性字节上限。 |
+| `agentDir` | string | *(未设置)* | 🟢 ACTIVE | Markdown agent 文件目录，用于新增或覆盖 `acp_delegate` 角色。 |
 | `protectedTools` | string\[\] | `无` | 🟢 ACTIVE | 工具名模式（支持 glob 后缀），其**所有** call+result 对都被硬排除在压缩之外（ref 渲染为 `BLOCKED`）。适用于低频高价值、输出为独立内容的工具——见下方 ⚠ 说明。 |
 | `protectedLatestTools` | string\[\] | `无` | 🟢 ACTIVE | 工具名模式（支持 glob 后缀），仅**最近一次** call+result 对被硬排除在压缩之外；更早的对仍可压缩。适用于累积快照型工具。 |
 | `neverPreserveRecentTools` | string\[\] | 内核内置（`["decompress", "search_context", "read", "bash"]`，需 acp-kernel >= 0.0.92） | 🟢 ACTIVE | 从软保护近期区**移除**的工具名模式，让它们的结果立即可压。默认让 `read`/`bash` 保持可压；只移除 `read`（保留 `decompress`/`search_context`）可解批量读文件的「折叠→重读」死循环。**空数组 `[]` 合法**（最大保护逃生门）。 |
@@ -300,6 +301,15 @@
   ```
 
   既不用重述（也不用冻结一份很快过时的手抄）内置列表，还自动跟随内置列表演进。可与显式 `neverPreserveRecentTools` 组合（减法同样作用于显式列表）；通配后缀模式移除匹配项（`"bash*"` 移除 `bash`）。**⚠ 空数组 `[]` 在这里不合法** —— 它是纯无操作，裸 `[]` 几乎必然是 `neverPreserveRecentTools: []`（最大保护逃生门）的笔误；畸形值告警并回退到 adapter 值。
+
+---
+
+### `agentDir`
+
+- **类型：** `string`
+- **默认值：** *(未设置)*
+- **状态：** 🟢 ACTIVE
+- **说明：** 目录内每个 `<name>.md` 文件对应一个 agent。设置后，`acp_delegate` 会加载这些定义，并按同名覆盖内置角色。支持 `~` 展开。frontmatter、解析优先级、`dryRun` 与 `acp_delegate_agents` 发现工具详见 README 的[可配置委派代理](./README.zh-CN.md#可配置委派代理agentdir)章节。
 
 ---
 

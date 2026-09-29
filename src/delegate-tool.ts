@@ -4,7 +4,7 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 import { createWriteStream, existsSync, type WriteStream } from "node:fs";
-import { mkdir, mkdtemp, writeFile, rm, appendFile, readFile, copyFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, writeFile, rm, appendFile, readFile, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Type, type Static } from "typebox";
@@ -17,6 +17,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { debug, logError, logInfo, logWarn } from "./log.js";
 import { DEFAULT_DELEGATE_POLICY, type DelegatePolicy, type DelegateRoleConfig } from "./config.js";
+import { resolveAgentDir, loadAgentDef, discoverAgentDefs, type AgentDirDef } from "./delegate-agents.js";
 import { attachWatchdogs } from "./delegate-watchdog.js";
 import { parseEventLine, activityLines, newPortion, ThinkingCollector, type Usage } from "./delegate-events.js";
 import { isPiHost } from "./runtime.js";
@@ -173,6 +174,207 @@ Answer the question concisely with clear reasoning. Cite file:line when referenc
 };
 
 const AGENT_NAMES = Object.keys(AGENTS);
+
+// ─── Agent resolution (configured md > built-in) ─────────────────────────────
+
+/** Effective agent definition after resolving configured md overrides
+ *  against built-in agents. Used by runDelegate and buildChildArgs. */
+interface ResolvedAgent {
+  name: string;
+  source: "configured" | "built-in";
+  prompt: string;
+  /** Configured agent: tool allowlist from md frontmatter. */
+  tools?: string[];
+  /** Built-in restricted role: the tools string from AGENTS. */
+  builtInTools?: string;
+  /** Built-in: whether the role receives a --tools allowlist. */
+  restricted?: boolean;
+  /** Configured agent: model override from md ("provider/id"). */
+  model?: string;
+  /** Configured agent: thinking level from md. */
+  thinking?: string;
+  /** Configured agent: model allowlist from md (not auto-fallback). */
+  allowedModels?: string[];
+  /** Configured agent: timeout in seconds from md. */
+  timeout?: number;
+}
+
+type ResolveResult =
+  | { ok: true; agent: ResolvedAgent }
+  | { ok: false; error: string };
+
+/** Resolve an agent by name, checking configured agentDir first, then
+ *  falling back to built-in AGENTS.
+ *
+ * Resolution logic:
+ * 1. If agentDir is configured, check if `<name>.md` exists.
+ *    a. File exists and valid -> configured agent overrides built-in.
+ *    b. File exists but invalid -> fail closed (return error, NO fallback).
+ *    c. File doesn't exist -> fall through to built-in.
+ * 2. If not configured (or file not found), check built-in AGENTS.
+ *    a. Found -> built-in agent.
+ *    b. Not found -> unknown agent error.
+ *
+ * Unknown agents with a configured file are allowed (custom agents).
+ * Unknown agents without a configured file are rejected.
+ */
+async function resolveAgent(
+  agentName: string,
+  resolvedDir: string | undefined,
+): Promise<ResolveResult> {
+  if (resolvedDir) {
+    const filePath = join(resolvedDir, `${agentName}.md`);
+    let fileExists = false;
+    try {
+      await access(filePath);
+      fileExists = true;
+    } catch {
+      fileExists = false;
+    }
+
+    if (fileExists) {
+      const result = await loadAgentDef(agentName, resolvedDir);
+      if (!result.ok) {
+        return {
+          ok: false,
+          error: `Agent "${agentName}" has a configured file but it failed to load: ${result.reason}`,
+        };
+      }
+      const def = result.def;
+      return {
+        ok: true,
+        agent: {
+          name: agentName,
+          source: "configured",
+          prompt: def.prompt,
+          tools: def.tools,
+          model: def.model,
+          thinking: def.thinking,
+          allowedModels: def.allowedModels,
+          timeout: def.timeout,
+        },
+      };
+    }
+  }
+
+  const builtIn = AGENTS[agentName];
+  if (!builtIn) {
+    const hint = resolvedDir
+      ? ` Built-in: ${AGENT_NAMES.join(", ")}. Custom agents can be configured via agentDir.`
+      : ` Choose one of: ${AGENT_NAMES.join(", ")}.`;
+    return { ok: false, error: `Unknown agent "${agentName}".${hint}` };
+  }
+
+  return {
+    ok: true,
+    agent: {
+      name: agentName,
+      source: "built-in",
+      prompt: builtIn.prompt,
+      restricted: builtIn.restricted,
+      builtInTools: builtIn.tools,
+    },
+  };
+}
+
+/** Effective thinking level: per-call > agent file > role config > global. */
+function resolveEffectiveThinking(args: DelegateArgs, resolved?: ResolvedAgent): string | undefined {
+  const roleCfg = delegateDefaults.agents?.[args.agent];
+  return pickFirstDefined([args.thinkingLevel, resolved?.thinking, roleCfg?.thinkingLevel, delegateDefaults.thinkingLevel]);
+}
+
+/** Build a sanitized dryRun plan without spawning a child or creating temp
+ *  files. Returns the effective resolution + arg plan.
+ *
+ * Sanitization:
+ * - No prompt body (only notes that --append-system-prompt will be used)
+ * - No full env or credentials
+ * - No temp file paths (only flag names)
+ * - Tool names listed (not tool contents)
+ */
+function planDryRun(
+  args: DelegateArgs,
+  resolved: ResolvedAgent,
+  ctx: ExtensionContext,
+  effectiveAsyncMs: number | null,
+  effectiveSyncMs: number | null,
+  agentFileTimeoutSec?: number,
+): string {
+  // Effective model: args.model > agent file > role config > ctx.model
+  let effectiveModel: string;
+  let modelSource: string;
+  if (args.model && args.model.includes("/")) {
+    effectiveModel = args.model;
+    modelSource = "per-call override";
+  } else if (resolved.model && resolved.model.includes("/")) {
+    effectiveModel = resolved.model;
+    modelSource = "agent file";
+  } else {
+    const roleModel = delegateDefaults.agents?.[args.agent]?.model;
+    if (roleModel && roleModel.includes("/")) {
+      effectiveModel = roleModel;
+      modelSource = "role config";
+    } else if (ctx.model) {
+      effectiveModel = `${ctx.model.provider}/${ctx.model.id}`;
+      modelSource = "inherited from parent";
+    } else {
+      effectiveModel = "(not set - Pi default)";
+      modelSource = "Pi default";
+    }
+  }
+
+  const effectiveThinking = resolveEffectiveThinking(args, resolved);
+
+  let toolsLine: string;
+  if (resolved.tools && resolved.tools.length > 0) {
+    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
+    toolsLine = `${merged.join(", ")} (--tools allowlist)`;
+  } else if (resolved.restricted && resolved.builtInTools) {
+    const merged = [...new Set([...resolved.builtInTools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    toolsLine = `${merged.join(", ")} (--tools allowlist)`;
+  } else {
+    toolsLine = "ambient (full default toolset, no --tools restriction)";
+  }
+
+  const cwd = args.cwd && args.cwd.trim() ? args.cwd : ctx.cwd;
+
+  const isAsync = args.async !== false && ctx.mode !== "print" && ctx.mode !== "json";
+  const timeoutLine =
+    args.timeoutMinutes !== undefined
+      ? `${args.timeoutMinutes}m (per-call override)`
+      : agentFileTimeoutSec !== undefined
+        ? `${agentFileTimeoutSec}s (agent file cap)`
+        : isAsync
+          ? effectiveAsyncMs === null ? "(disabled)" : fmtMinutes(effectiveAsyncMs)
+          : effectiveSyncMs === null ? "(disabled)" : fmtMinutes(effectiveSyncMs);
+
+  const lines: string[] = [
+    `**DryRun plan for agent "${args.agent}"**`,
+    ``,
+    `- source: ${resolved.source}${resolved.source === "configured" ? " (from agentDir)" : ""}`,
+    `- model: ${effectiveModel} (${modelSource})`,
+    `- thinking: ${effectiveThinking ?? "(not set)"}`,
+    `- tools: ${toolsLine}`,
+    `- timeout: ${timeoutLine}`,
+    `- cwd: ${cwd}`,
+  ];
+
+  // CLI flags that would be emitted (names only, no temp paths). Async
+  // delegates run in JSON event stream mode; sync run plain print mode.
+  const sessionFlags = isPiHost(ctx.sessionManager)
+    ? ["--session", "<run-scoped>", "--session-dir", "<out-dir>"]
+    : ["--no-session"];
+  const flags: string[] = isAsync
+    ? ["--mode", "json", ...sessionFlags, "--append-system-prompt"]
+    : ["-p", ...sessionFlags, "--append-system-prompt"];
+  if (resolved.tools?.length || (resolved.restricted && resolved.builtInTools)) flags.push("--tools");
+  if (effectiveModel.includes("/")) flags.push("--provider", "--model");
+  if (effectiveThinking) flags.push("--thinking");
+  lines.push(`- mode: ${isAsync ? "async (JSON event stream)" : "sync (print)"}`);
+  lines.push(`- CLI flags: ${flags.join(", ")}`);
+
+  return lines.join("\n");
+}
 
 // ─── Run registry (module-level, shared across tools) ───────────────────────
 
@@ -591,7 +793,7 @@ export function resolvePerCallTimeoutMs(raw: number | undefined, fallbackMs: num
 
 const DelegateParams = Type.Object({
   agent: Type.String({
-    description: `Role of the delegate. One of: ${AGENT_NAMES.join(", ")}. See tool description for what each does.`,
+    description: `Role of the delegate. Built-in: ${AGENT_NAMES.join(", ")}. Custom agents may be available if configured via the \`agentDir\` setting in ~/.pi/acp.json.`,
   }),
   task: Type.Optional(
     Type.String({
@@ -607,10 +809,10 @@ const DelegateParams = Type.Object({
     Type.String({ description: "Working directory for the delegate (default: current project dir)." }),
   ),
   model: Type.Optional(
-    Type.String({ description: 'Model override as "provider/id". Default: this role\'s configured model (delegate.agents.<role>.model), else inherit the current model.' }),
+    Type.String({ description: 'Model override as "provider/id". Default: this role\'s agent-file model (agentDir), else delegate.agents.<role>.model, else inherit the current model.' }),
   ),
   thinkingLevel: Type.Optional(
-    Type.String({ description: `Per-call thinking-level override: ${VALID_THINKING_LEVELS.join("|")}. Default: this role's configured level, else the global delegate.thinkingLevel, else Pi's own default.` }),
+    Type.String({ description: `Per-call thinking-level override: ${VALID_THINKING_LEVELS.join("|")}. Default: this role's agent-file level (agentDir), else its configured level, else the global delegate.thinkingLevel, else Pi's own default.` }),
   ),
   async: Type.Optional(
     Type.Boolean({
@@ -624,7 +826,12 @@ const DelegateParams = Type.Object({
   ),
   timeoutMinutes: Type.Optional(
     Type.Number({
-      description: `Per-call override for this run's hard wall-clock timeout, in minutes (e.g. 90). When async=true it overrides the async hard limit; when async=false it overrides the sync limit. Omit to use the configured default (delegate.asyncTimeoutMinutes / syncTimeoutMinutes via acp.json or env). Capped at ${MAX_PER_CALL_TIMEOUT_MINUTES}m (24h); the no-output (idle) watchdog is unaffected.`,
+      description: `Per-call override for this run's hard wall-clock timeout, in minutes (e.g. 90). When async=true it overrides the async hard limit; when async=false it overrides the sync limit. Omit to use the configured default (delegate.asyncTimeoutMinutes / syncTimeoutMinutes via acp.json or env). An agent file timeout (agentDir) caps the effective limit but never extends it; the per-call value takes priority over that cap. Capped at ${MAX_PER_CALL_TIMEOUT_MINUTES}m (24h); the no-output (idle) watchdog is unaffected.`,
+    }),
+  ),
+  dryRun: Type.Optional(
+    Type.Boolean({
+      description: "If true, resolve and validate the agent, model, thinking, and tools, but do NOT spawn a child process. Returns a sanitized effective plan (no prompt body, no env, no temp paths). Use to preview what a delegate run would do.",
     }),
   ),
 });
@@ -693,7 +900,7 @@ const agentListLine = (name: string): string => {
   return `  • ${name} - ${blurb[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
 };
 
-export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof DelegateParams> {
+export function makeDelegateTool(pi: ExtensionAPI, agentDir?: string): ToolDefinition<typeof DelegateParams> {
   const maxConcurrent = delegatePolicy.maxConcurrent;
   const concurrencyNote = Number.isFinite(maxConcurrent)
     ? `\n• Concurrency limit: at most ${maxConcurrent} background delegate(s) run at once; extra launches stay QUEUED and start automatically as slots free. Set delegate.maxConcurrent in acp.json (or PI_ACP_DELEGATE_MAX_CONCURRENT) to change it.`
@@ -705,6 +912,8 @@ export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof Delega
 
 Agents (pick by name):
 ${AGENT_NAMES.map(agentListLine).join("\n")}
+
+When \`agentDir\` is set in acp.json, agents are additionally loaded from Markdown files in that directory: a configured file overrides a built-in of the same name, and custom names extend the roster. Call acp_delegate_agents to list the effective roster and each agent's settings.
 
 Behavior:
 • async=true (default): returns immediately with a runId. The delegate runs in the background. Call acp_delegate_wait({ runId }) to block for its result (up to a timeout); if you let the timeout lapse, or never call wait, a short completion notification (status + file path) is still injected into this chat when it finishes — unless you already read the result file after it finished, in which case the notification is skipped (you have the result). In one-shot sessions (print/json) async auto-downgrades to sync so the result is returned inline within the same turn. Call acp_delegate again to launch more runs in parallel.${concurrencyNote}
@@ -731,7 +940,7 @@ The delegate runs in its own clean pi process — it does NOT see this conversat
     parameters: DelegateParams,
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       const args = params as DelegateArgs;
-      let outcome = await runDelegate(pi, args, ctx, signal);
+      let outcome = await runDelegate(pi, args, ctx, signal, agentDir);
       const notice = undeliveredNotice();
       if (notice) outcome = `${notice}\n\n${outcome}`;
       return { details: undefined, content: [{ type: "text", text: outcome }] };
@@ -1210,11 +1419,14 @@ async function runDelegate(
   args: DelegateArgs,
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
+  agentDir?: string,
 ): Promise<string> {
-  const agent = AGENTS[args.agent];
-  if (!agent) {
-    return `Unknown agent "${args.agent}". Choose one of: ${AGENT_NAMES.join(", ")}.`;
+  const resolvedDir = resolveAgentDir(agentDir);
+  const resolution = await resolveAgent(args.agent, resolvedDir);
+  if (!resolution.ok) {
+    return resolution.error;
   }
+  const resolved = resolution.agent;
   const parentDepth = Number(process.env.PI_ACP_DELEGATE_DEPTH ?? "0");
   const maxDepth = delegatePolicy.maxDepth;
   if (Number.isNaN(parentDepth) || parentDepth >= maxDepth) {
@@ -1241,10 +1453,54 @@ async function runDelegate(
   }
   const taskText = args.task?.trim() || (args.resumeFrom ? "(resumed — the original task is in the session history)" : "");
 
+  // Configured agents with a model or allowed-models set expose an allowlist
+  // for a per-call model override (not a fallback list; no auto-retry).
+  if (resolved.source === "configured" && args.model) {
+    const hasAllowedModels = resolved.allowedModels && resolved.allowedModels.length > 0;
+    const hasModel = !!resolved.model;
+    if (hasAllowedModels || hasModel) {
+      const allowed = new Set<string>([
+        ...(resolved.allowedModels ?? []),
+        ...(resolved.model ? [resolved.model] : []),
+      ]);
+      if (!allowed.has(args.model)) {
+        return `Model "${args.model}" is not in the allowed set for agent "${args.agent}" (configured). Allowed models: ${[...allowed].join(", ")}. Remove the model override or use one of the allowed models.`;
+      }
+    }
+  }
+
+  // Per-call hard-timeout override (#286): the model sizes a specific run's
+  // wall-clock budget instead of relying on the global acp.json/env default.
+  // Applies to the async hard limit or the sync limit depending on mode; the
+  // no-output (idle) watchdog is intentionally left at its global value.
+  let effectiveAsyncMs = resolvePerCallTimeoutMs(args.timeoutMinutes, delegatePolicy.asyncTimeoutMs);
+  let effectiveSyncMs = resolvePerCallTimeoutMs(args.timeoutMinutes, delegatePolicy.syncTimeoutMs);
+  // Agent-file timeout (seconds) caps whichever limit applies; it never
+  // extends a configured limit. A per-call override takes priority.
+  let agentFileTimeoutSec: number | undefined;
+  if (args.timeoutMinutes === undefined && resolved.timeout !== undefined) {
+    agentFileTimeoutSec = resolved.timeout;
+    const mdMs = resolved.timeout * 1000;
+    effectiveAsyncMs = effectiveAsyncMs === null ? mdMs : Math.min(effectiveAsyncMs, mdMs);
+    effectiveSyncMs = effectiveSyncMs === null ? mdMs : Math.min(effectiveSyncMs, mdMs);
+  }
+  // dryRun: complete resolution + validation + arg planning, but NO spawn.
+  // Returns a sanitized plan (no prompt body, no env, no temp paths).
+  if (args.dryRun) {
+    debug.event("delegate-dryrun", {
+      agent: args.agent,
+      source: resolved.source,
+      hasModel: !!resolved.model,
+      hasThinking: !!resolved.thinking,
+      hasTools: !!(resolved.tools && resolved.tools.length > 0),
+    });
+    return planDryRun(args, resolved, ctx, effectiveAsyncMs, effectiveSyncMs, agentFileTimeoutSec);
+  }
+
   const cwd = args.cwd && args.cwd.trim() ? args.cwd : ctx.cwd;
   const childEnv = delegateChildEnv(parentDepth, maxDepth);
   const runId = `del_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const { cliArgs, tmpDir, isAsync, useJsonStream, sessionFile } = await buildChildArgs(args, agent.prompt, ctx, runId);
+  const { cliArgs, tmpDir, isAsync, useJsonStream, sessionFile } = await buildChildArgs(args, resolved.prompt, ctx, runId, resolved);
   // One-shot modes (print/json = `pi -p` / SDK) exit after one turn, so async
   // injection (a follow-up turn) is never observed. Downgrade to sync there:
   // the result returns as the tool result within the same turn. Long-lived
@@ -1254,12 +1510,6 @@ async function runDelegate(
     debug.event("delegate-async-downgraded", { reason: `mode=${ctx.mode}` });
     logInfo("delegate", { event: "async-downgraded", reason: `mode=${ctx.mode}` });
   }
-  // Per-call hard-timeout override (#286): the model sizes a specific run's
-  // wall-clock budget instead of relying on the global acp.json/env default.
-  // Applies to the async hard limit or the sync limit depending on mode; the
-  // no-output (idle) watchdog is intentionally left at its global value.
-  const effectiveAsyncMs = resolvePerCallTimeoutMs(args.timeoutMinutes, delegatePolicy.asyncTimeoutMs);
-  const effectiveSyncMs = resolvePerCallTimeoutMs(args.timeoutMinutes, delegatePolicy.syncTimeoutMs);
   debug.event("delegate-spawn", { agent: args.agent, runId, cwd, async: isAsync, useJsonStream, cliArgs, resumedFrom: args.resumeFrom, sessionFile });
   logInfo("delegate", { event: "spawn", agent: args.agent, runId, cwd, async: isAsync, useJsonStream, mode: ctx.mode, parentDepth, resumedFrom: args.resumeFrom, sessionFile });
 
@@ -1323,7 +1573,13 @@ async function runDelegate(
             debug.event("delegate-eof-grace", { runId, ms: EOF_GRACE_MS });
           },
         },
-        { eofGraceMs: EOF_GRACE_MS, idleMs: delegatePolicy.idleMs, timeoutMs: effectiveAsyncMs, killGraceMs: KILL_GRACE_MS },
+        {
+          eofGraceMs: EOF_GRACE_MS,
+          idleMs: delegatePolicy.idleMs,
+          timeoutMs: effectiveAsyncMs,
+          timeoutReason: agentFileTimeoutSec !== undefined ? `${agentFileTimeoutSec}s limit` : undefined,
+          killGraceMs: KILL_GRACE_MS,
+        },
       );
       // Two stream files are fed from the --mode json event stream: text_delta
       // tokens go to the reply stream (.out), tool activity (and optionally
@@ -1586,6 +1842,7 @@ export async function buildChildArgs(
   rolePrompt: string,
   ctx: ExtensionContext,
   runId: string,
+  resolved?: ResolvedAgent,
 ): Promise<{ cliArgs: string[]; tmpDir: string; isAsync: boolean; useJsonStream: boolean; sessionFile: string | null }> {
   const tmpDir = await mkdtemp(join(tmpdir(), "acp-delegate-"));
   // Combine the role prompt with a small framing instruction so the child
@@ -1619,36 +1876,54 @@ export async function buildChildArgs(
     ? ["--mode", "json", ...sessionArgs, "--append-system-prompt", promptFile]
     : ["-p", ...sessionArgs, "--append-system-prompt", promptFile];
 
-  // Restricted roles receive a tailored --tools allowlist. Worker and
-  // unknown agents are left on Pi's full default toolset (all extension/
+  // Tools: a configured agent's md allowlist > built-in restricted roster;
+  // otherwise the child keeps Pi's full default toolset (all extension/
   // custom tools stay active). The allowlist is a *soft guardrail*: it
   // prevents accidental edit/write by read-only roles, but bash can bypass
   // it - this is not a security boundary.
-  const agentDef = AGENTS[args.agent];
-  if (agentDef?.restricted) {
-    const merged = [...new Set([...agentDef.tools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+  if (resolved?.tools && resolved.tools.length > 0) {
+    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
     cliArgs.push("--tools", merged.join(","));
+  } else if (resolved?.restricted && resolved.builtInTools) {
+    const merged = [...new Set([...resolved.builtInTools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    cliArgs.push("--tools", merged.join(","));
+  } else if (!resolved) {
+    // Direct buildChildArgs callers (tests) without a resolution: roster lookup.
+    const agentDef = AGENTS[args.agent];
+    if (agentDef?.restricted) {
+      const merged = [...new Set([...agentDef.tools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+      cliArgs.push("--tools", merged.join(","));
+    }
   }
 
-  // Model: per-call > role default (delegate.agents.<role>.model) > inherit parent.
-  // A role-configured model is validated against the live registry; a missing one
-  // falls back to the parent model with a warning and never fails (omo lesson).
-  // Per-call and inherited models pass through untouched — a per-call override is a
-  // deliberate choice that may name a custom/non-catalog model pi resolves itself.
+  // Model: per-call > agent file (agentDir md) > role default
+  // (delegate.agents.<role>.model) > inherit parent.
+  // An agent-file model passes through untouched — the file may name a
+  // custom/non-catalog model pi resolves itself. A role-configured model is
+  // validated against the live registry; a missing one falls back to the
+  // parent model with a warning and never fails (omo lesson). Per-call and
+  // inherited models pass through untouched — a per-call override is a
+  // deliberate choice that may name a custom/non-catalog model.
   const roleCfg = delegateDefaults.agents?.[args.agent];
   const callModel = normalizeModelRef(args.model);
+  const agentFileModel = normalizeModelRef(resolved?.model);
   const roleModel = normalizeModelRef(roleCfg?.model);
   const parentProvider = ctx.model?.provider;
   const parentModelId = ctx.model?.id;
 
   let provider: string | undefined;
   let modelId: string | undefined;
-  let source: "call" | "role" | "inherit" = "inherit";
+  let source: "call" | "agent-file" | "role" | "inherit" = "inherit";
   if (callModel) {
     const parts = callModel.split("/");
     provider = parts[0];
     modelId = parts.slice(1).join("/");
     source = "call";
+  } else if (agentFileModel) {
+    const parts = agentFileModel.split("/");
+    provider = parts[0];
+    modelId = parts.slice(1).join("/");
+    source = "agent-file";
   } else if (roleModel) {
     const parts = roleModel.split("/");
     provider = parts[0];
@@ -1681,10 +1956,10 @@ export async function buildChildArgs(
     cliArgs.push("--provider", provider, "--model", modelId);
   }
 
-  // Thinking level: per-call > role default > global default > (none = Pi default).
-  // Only the highest-priority defined value is used; an invalid value warns and is
-  // dropped rather than cascading to a lower-priority one.
-  const thinkingPick = pickFirstDefined([args.thinkingLevel, roleCfg?.thinkingLevel, delegateDefaults.thinkingLevel]);
+  // Thinking level: per-call > agent file > role default > global default >
+  // (none = Pi default). Only the highest-priority defined value is used; an
+  // invalid value warns and is dropped rather than cascading to a lower one.
+  const thinkingPick = resolveEffectiveThinking(args, resolved);
   if (thinkingPick !== undefined) {
     if (isValidThinkingLevel(thinkingPick)) {
       cliArgs.push("--thinking", thinkingPick);
@@ -1702,10 +1977,15 @@ interface ChildResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Effective timeout limit in seconds when the timer fired. */
+  timeoutLimitSec?: number;
+  /** Wall-clock elapsed seconds until the timeout fired. */
+  elapsedSec?: number;
 }
 
 function waitForChild(child: ChildProcess, signal: AbortSignal | undefined, timeoutMs: number | null): Promise<ChildResult> {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const stdoutChunks: Buffer[] = [];
     let stderrText = "";
     child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
@@ -1717,7 +1997,14 @@ function waitForChild(child: ChildProcess, signal: AbortSignal | undefined, time
     if (timeoutMs !== null) {
       timer = setTimeout(() => {
         child.kill("SIGTERM");
-        finish({ code: null, stdout: "", stderr: stderrText, timedOut: true });
+        finish({
+          code: null,
+          stdout: "",
+          stderr: stderrText,
+          timedOut: true,
+          timeoutLimitSec: Math.round(timeoutMs / 1000),
+          elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+        });
       }, timeoutMs);
     }
 
@@ -1749,6 +2036,7 @@ function waitForChild(child: ChildProcess, signal: AbortSignal | undefined, time
 }
 
 function fmtMinutes(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
   const m = ms / 60_000;
   return Number.isInteger(m) ? `${m}m` : `${m.toFixed(1)}m`;
 }
@@ -1768,12 +2056,18 @@ export function asyncWatchdogDescription(overrideAsyncMs?: number | null): strin
 
 export function formatSyncResult(agent: string, runId: string, task: string, r: ChildResult, file: string): string {
   const noOutput = genuineNoOutput(r.code, r.timedOut, r.stdout);
-  const status = r.timedOut ? "timed out" : r.code === 0 && !noOutput ? "completed" : "FAILED ⚠️";
+  if (r.timedOut) {
+    const limit = r.timeoutLimitSec ? `${r.timeoutLimitSec}s` : "?";
+    const elapsed = r.elapsedSec ? `${r.elapsedSec}s` : "?";
+    const header = `Delegate **${agent}** FAILED ⚠️ (timed out) (runId \`${runId}\`, limit ${limit}, elapsed ${elapsed}).`;
+    return formatPayload(header, file, task, "(timed out)");
+  }
+  const status = r.code === 0 && !noOutput ? "completed" : "FAILED ⚠️";
   const header = `Delegate **${agent}** ${status} (runId \`${runId}\`, ${exitLabel(r.code, r.signal)}).`;
-  if (r.code === 0 && !r.timedOut && !noOutput) {
+  if (r.code === 0 && !noOutput) {
     return formatPayload(header, file, task);
   }
-  const body = r.timedOut ? "(timed out)" : r.code === 0 ? NO_FINAL_OUTPUT_BODY : (r.stderr.trim() || "(no stderr)");
+  const body = noOutput ? NO_FINAL_OUTPUT_BODY : (r.stderr.trim() || "(no stderr)");
   return formatPayload(header, file, task, body);
 }
 
@@ -2011,4 +2305,98 @@ async function cleanupTmp(tmpDir: string | null): Promise<void> {
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1) + "…";
+}
+
+// ─── Agent discovery tool (read-only) ─────────────────────────────────────────
+
+const AgentListParams = Type.Object({});
+
+/** Format a configured agent entry for the discovery tool output.
+ *  Deliberately minimal: name/source/model/thinking/tools policy/timeout -
+ *  never prompt body, env, credentials, or the absolute source path. */
+function formatConfiguredAgentLine(name: string, def: AgentDirDef, alsoBuiltIn: boolean): string {
+  const parts: string[] = [`  • ${name} [configured]`];
+  if (alsoBuiltIn) parts.push("(built-in also available)");
+  parts.push(`model: ${def.model ?? "(inherit)"}`);
+  parts.push(`thinking: ${def.thinking ?? "(not set)"}`);
+  if (def.tools && def.tools.length > 0) {
+    const merged = [...new Set([...def.tools, ...ACP_TOOLS])];
+    parts.push(`tools: ${merged.join(",")} (allowlist)`);
+  } else {
+    parts.push("tools: ambient (full default toolset)");
+  }
+  parts.push(`timeout: ${def.timeout ? `${def.timeout}s` : "(not set)"}`);
+  return parts.join(", ");
+}
+
+/** Format a built-in agent entry. When overridden by a configured file, the
+ *  built-in is noted as still available (the configured one is effective). */
+function formatBuiltInAgentLine(name: string, def: AgentDef, overridden: boolean): string {
+  const parts: string[] = [`  • ${name} [built-in]`];
+  if (overridden) parts.push("(overridden by configured - still available)");
+  parts.push("model: (inherit)");
+  parts.push("thinking: (not set)");
+  if (def.restricted) {
+    const merged = [...new Set([...def.tools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    parts.push(`tools: ${merged.join(",")} (allowlist)`);
+  } else {
+    parts.push("tools: ambient (full default toolset)");
+  }
+  parts.push("timeout: (not set)");
+  return parts.join(", ");
+}
+
+/** Read-only discovery tool: list all delegate agents (built-in + configured
+ *  + invalid). No side effects. A broken configured file is listed with its
+ *  reason but does NOT block other entries; a single acp_delegate call on an
+ *  invalid name still fails closed (see resolveAgent). */
+export function makeDelegateAgentsTool(agentDir?: string): ToolDefinition<typeof AgentListParams> {
+  return {
+    name: "acp_delegate_agents",
+    label: "ACP Delegate Agents",
+    description:
+      "List all available delegate agents (built-in roles plus any configured in the agentDir, e.g. ~/.pi/agent/agents). Read-only - no side effects. Shows the effective source, model, thinking, tools policy, and timeout for each agent, plus any configured agent files that failed to parse.",
+    promptSnippet: "acp_delegate_agents()",
+    promptGuidelines: [
+      "Call this before acp_delegate to discover valid agent names and their effective settings.",
+    ],
+    parameters: AgentListParams,
+    async execute(): Promise<AgentToolResult<unknown>> {
+      const lines: string[] = ["Available delegate agents:", ""];
+
+      const resolvedDir = resolveAgentDir(agentDir);
+      const discovered = resolvedDir ? await discoverAgentDefs(resolvedDir) : [];
+      const validConfigured = discovered.filter((d) => d.ok);
+      const configuredNames = new Set(validConfigured.map((d) => d.name));
+
+      if (validConfigured.length > 0) {
+        lines.push("Configured (from agentDir):");
+        for (const d of validConfigured) {
+          lines.push(formatConfiguredAgentLine(d.name, d.def!, AGENT_NAMES.includes(d.name)));
+        }
+        lines.push("");
+      }
+
+      const invalidConfigured = discovered.filter((d) => !d.ok);
+      if (invalidConfigured.length > 0) {
+        lines.push("Invalid (configured but failed to load - acp_delegate rejects these):");
+        for (const d of invalidConfigured) {
+          lines.push(`  • ${d.name} [configured] INVALID: ${d.error}`);
+        }
+        lines.push("");
+      }
+
+      lines.push("Built-in:");
+      for (const name of AGENT_NAMES) {
+        if (configuredNames.has(name)) continue;
+        const def = AGENTS[name];
+        if (!def) continue;
+        lines.push(formatBuiltInAgentLine(name, def, false));
+      }
+      lines.push("");
+      lines.push("All agents run with fresh context in their own pi process.");
+
+      return { details: undefined, content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  };
 }

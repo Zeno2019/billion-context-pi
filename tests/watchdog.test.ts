@@ -15,7 +15,7 @@ interface Harness {
   watchdog: ReturnType<typeof attachWatchdogs>;
 }
 
-function setup(overrides?: { idleMs?: number | null; timeoutMs?: number | null; killGraceMs?: number; eofGraceMs?: number; initiallySettled?: boolean }): Harness {
+function setup(overrides?: { idleMs?: number | null; timeoutMs?: number | null; killGraceMs?: number; eofGraceMs?: number; initiallySettled?: boolean; timeoutReason?: string }): Harness {
   const stdout = new EventEmitter();
   const kills: NodeJS.Signals[] = [];
   const reasons: string[] = [];
@@ -40,6 +40,7 @@ function setup(overrides?: { idleMs?: number | null; timeoutMs?: number | null; 
       eofGraceMs: overrides?.eofGraceMs ?? 1_000,
       idleMs: overrides?.idleMs !== undefined ? overrides.idleMs : 1_000,
       timeoutMs: overrides?.timeoutMs !== undefined ? overrides.timeoutMs : 60_000,
+      timeoutReason: overrides?.timeoutReason,
       killGraceMs: overrides?.killGraceMs ?? 1_000,
     },
   );
@@ -97,6 +98,14 @@ test("hard time limit kills regardless of output", async () => {
   await sleep(80);
   assert.deepEqual(h.kills, ["SIGTERM"], "time limit fired");
   assert.ok(h.reasons[0].includes("limit"), `reason names limit: ${h.reasons[0]}`);
+  h.watchdog.dispose();
+});
+
+test("custom timeoutReason replaces the default m-limit label (per-call/agent timeout)", async () => {
+  const h = setup({ timeoutMs: 40, timeoutReason: "45s limit" });
+  await sleep(80);
+  assert.deepEqual(h.kills, ["SIGTERM"], "time limit fired");
+  assert.equal(h.reasons[0], "45s limit", "custom label used verbatim");
   h.watchdog.dispose();
 });
 
