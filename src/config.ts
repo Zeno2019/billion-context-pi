@@ -377,6 +377,8 @@ export interface AdapterConfig {
   /** Replace (string) or remove (null) the ACP_DELEGATE_NOTIFICATIONS appendix
    *  injected when the delegate tool is enabled. */
   delegatePrompt?: string | null;
+  /** Host-supplied context tool names for delegate allowlists; not read from acp.json. */
+  delegateContextTools?: readonly string[];
   coreOverrides?: Partial<Config>;
 }
 

@@ -1,5 +1,7 @@
 [English](./README.md) | [中文](./README.zh-CN.md)
 
+> 本地 fork：已合并上游 **0.1.83**，采用适用于 **Pi 0.87.1** 的 lean 上下文工具入口，并保留自定义 BCP 子代理。参见[本地配置、验证与回退说明](./LOCAL-LEAN.md)；下文上游文档也包含原入口的行为说明。
+
 <p align="center">
 <strong>Billion-Context</strong> — <a href="https://pi.dev">Pi</a> 的上下文压缩插件
 <br />

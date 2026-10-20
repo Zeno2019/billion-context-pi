@@ -327,10 +327,10 @@ function planDryRun(
 
   let toolsLine: string;
   if (resolved.tools && resolved.tools.length > 0) {
-    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
+    const merged = withAcpTools(resolved.tools);
     toolsLine = `${merged.join(", ")} (--tools allowlist)`;
   } else if (resolved.restricted && resolved.builtInTools) {
-    const merged = [...new Set([...resolved.builtInTools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    const merged = withAcpTools(resolved.builtInTools.split(",").map((s) => s.trim()));
     toolsLine = `${merged.join(", ")} (--tools allowlist)`;
   } else {
     toolsLine = "ambient (full default toolset, no --tools restriction)";
@@ -522,14 +522,27 @@ const delegateGate = new ConcurrencyGate(() => delegatePolicy.maxConcurrent);
 // from adapter.delegate. buildChildArgs reads them at spawn time. Kept as module
 // state (mirroring delegateDisplayUsage) so buildChildArgs stays testable without
 // threading config through every call site.
-let delegateDefaults: { thinkingLevel?: string; agents?: Record<string, DelegateRoleConfig> } = {};
+interface DelegateDefaults {
+  thinkingLevel?: string;
+  agents?: Record<string, DelegateRoleConfig>;
+  contextTools?: readonly string[];
+}
+let delegateDefaults: DelegateDefaults = {};
 
-export function setDelegateDefaults(d: { thinkingLevel?: string; agents?: Record<string, DelegateRoleConfig> } | undefined): void {
+export function setDelegateDefaults(d: DelegateDefaults | undefined): void {
   delegateDefaults = d ?? {};
 }
 
 export function resetDelegateDefaults(): void {
   delegateDefaults = {};
+}
+
+function withAcpTools(tools: readonly string[]): string[] {
+  const contextTools = delegateDefaults.contextTools;
+  const supplied = contextTools
+    ? tools.filter(name => !(ACP_TOOLS as readonly string[]).includes(name) && name !== "acp_cache" && name !== "acp_context")
+    : tools;
+  return [...new Set([...supplied, ...(contextTools ?? ACP_TOOLS)])];
 }
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -1882,16 +1895,16 @@ export async function buildChildArgs(
   // prevents accidental edit/write by read-only roles, but bash can bypass
   // it - this is not a security boundary.
   if (resolved?.tools && resolved.tools.length > 0) {
-    const merged = [...new Set([...resolved.tools, ...ACP_TOOLS])];
+    const merged = withAcpTools(resolved.tools);
     cliArgs.push("--tools", merged.join(","));
   } else if (resolved?.restricted && resolved.builtInTools) {
-    const merged = [...new Set([...resolved.builtInTools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    const merged = withAcpTools(resolved.builtInTools.split(",").map((s) => s.trim()));
     cliArgs.push("--tools", merged.join(","));
   } else if (!resolved) {
     // Direct buildChildArgs callers (tests) without a resolution: roster lookup.
     const agentDef = AGENTS[args.agent];
     if (agentDef?.restricted) {
-      const merged = [...new Set([...agentDef.tools.split(",").map(s => s.trim()), ...ACP_TOOLS])];
+      const merged = withAcpTools(agentDef.tools.split(",").map(s => s.trim()));
       cliArgs.push("--tools", merged.join(","));
     }
   }
@@ -2320,7 +2333,7 @@ function formatConfiguredAgentLine(name: string, def: AgentDirDef, alsoBuiltIn: 
   parts.push(`model: ${def.model ?? "(inherit)"}`);
   parts.push(`thinking: ${def.thinking ?? "(not set)"}`);
   if (def.tools && def.tools.length > 0) {
-    const merged = [...new Set([...def.tools, ...ACP_TOOLS])];
+    const merged = withAcpTools(def.tools);
     parts.push(`tools: ${merged.join(",")} (allowlist)`);
   } else {
     parts.push("tools: ambient (full default toolset)");
@@ -2337,7 +2350,7 @@ function formatBuiltInAgentLine(name: string, def: AgentDef, overridden: boolean
   parts.push("model: (inherit)");
   parts.push("thinking: (not set)");
   if (def.restricted) {
-    const merged = [...new Set([...def.tools.split(",").map((s) => s.trim()), ...ACP_TOOLS])];
+    const merged = withAcpTools(def.tools.split(",").map((s) => s.trim()));
     parts.push(`tools: ${merged.join(",")} (allowlist)`);
   } else {
     parts.push("tools: ambient (full default toolset)");

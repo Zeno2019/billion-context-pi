@@ -262,11 +262,11 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
       name: "acp-subagents",
       options: {
         description:
-          "Add ACP context tools (compress/decompress/search_context/acp_status) to pi-subagents' builtin agents. " +
+          "Add the active ACP context tools to pi-subagents' builtin agents. " +
           "One-time setup — re-run after upgrading pi-subagents. Usage: /acp-subagents [installDir]",
         handler: async (args, ctx) => {
           const installDir = args.trim();
-          const result = ensureSubagentAcpTools(undefined, installDir ? { installDir } : undefined);
+          const result = ensureSubagentAcpTools(undefined, { installDir: installDir || undefined, contextTools: runtime.adapter.delegateContextTools });
           if (result.action === "updated") {
             ctx.ui.notify(`ACP tools enabled for pi-subagents agents in ${result.path}`);
           } else if (result.action === "skipped") {

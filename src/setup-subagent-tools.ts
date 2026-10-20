@@ -38,6 +38,7 @@ export interface SetupOptions {
   cwd?: string;
   /** Explicit install directory (skips detection; for git installs or forks). */
   installDir?: string;
+  contextTools?: readonly string[];
 }
 
 /**
@@ -179,9 +180,11 @@ export function discoverBuiltinAgents(installDir: string): ParsedBuiltin[] {
 }
 
 /** Frontmatter tools + ACP tools, preserving order and removing duplicates. */
-function desiredTools(baseTools: string[] | undefined): string[] {
-  const tools = baseTools ? [...baseTools] : [];
-  for (const tool of ACP_TOOLS) {
+function desiredTools(baseTools: string[] | undefined, contextTools?: readonly string[]): string[] {
+  const tools = contextTools
+    ? (baseTools ?? []).filter(name => !(ACP_TOOLS as readonly string[]).includes(name) && name !== "acp_cache" && name !== "acp_context")
+    : [...(baseTools ?? [])];
+  for (const tool of contextTools ?? ACP_TOOLS) {
     if (!tools.includes(tool)) tools.push(tool);
   }
   return tools;
@@ -252,12 +255,13 @@ export function ensureSubagentAcpTools(settingsPath?: string, options?: SetupOpt
         ? existing.tools
         : frontmatterByName.get(name);
     if (baseTools === undefined) continue; // Unrestricted agent — nothing to grant.
-    const wanted = desiredTools(baseTools);
+    const wanted = desiredTools(baseTools, options?.contextTools);
     const current = existing?.tools;
     if (
       Array.isArray(current) &&
       current.length > 0 &&
-      wanted.every((tool) => current.includes(tool))
+      wanted.every((tool) => current.includes(tool)) &&
+      (!options?.contextTools || current.length === wanted.length)
     ) {
       continue; // Already complete — keep the existing list untouched.
     }
@@ -299,7 +303,7 @@ export function ensureSubagentAcpTools(settingsPath?: string, options?: SetupOpt
     for (const b of builtins) {
       const entry = writtenOverrides[b.name];
       const tools = entry?.tools ?? [];
-      if (frontmatterByName.get(b.name) !== undefined && !ACP_TOOLS.every((t) => tools.includes(t))) {
+      if (frontmatterByName.get(b.name) !== undefined && !(options?.contextTools ?? ACP_TOOLS).every((t) => tools.includes(t))) {
         fs.copyFileSync(backupPath, path_);
         return { path: path_, action: "failed", reason: "post-write verification failed" };
       }

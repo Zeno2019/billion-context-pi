@@ -180,6 +180,30 @@ describe("ensureSubagentAcpTools — pi-subagents detection (#179)", () => {
 });
 
 describe("ensureSubagentAcpTools — merge behavior", () => {
+  it("migrates legacy ACP names to the lean tools while preserving custom tools and remaining idempotent", () => {
+    const installDir = path.join(projectDir, "vendor", "pi-subagents");
+    installPiSubagents(installDir);
+    writeSettings({
+      subagents: {
+        agentOverrides: {
+          worker: { tools: ["bash", "compress", "read", "decompress", "search_context", "acp_status", "acp_cache", "contact_supervisor"], model: "custom-model" },
+        },
+      },
+    });
+    const options = { installDir, contextTools: ["compress", "acp_context"] };
+
+    assert.equal(ensureSubagentAcpTools(settingsPath, options).action, "updated");
+    const overrides = overridesOf(readSettings());
+    assert.deepEqual(overrides.worker.tools, ["bash", "read", "contact_supervisor", "compress", "acp_context"]);
+    assert.equal(overrides.worker.model, "custom-model");
+    assert.deepEqual(overrides.reviewer.tools, ["read", "grep", "find", "ls", "compress", "acp_context"]);
+    assert.equal(overrides.oracle, undefined);
+
+    const snapshot = fs.readFileSync(settingsPath, "utf-8");
+    assert.equal(ensureSubagentAcpTools(settingsPath, options).action, "skipped");
+    assert.equal(fs.readFileSync(settingsPath, "utf-8"), snapshot);
+  });
+
   it("appends missing ACP tools to a user-custom override", () => {
     installPiSubagents(path.join(agentDir, "npm", "node_modules", "pi-subagents"));
     writeSettings({

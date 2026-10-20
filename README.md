@@ -2,6 +2,8 @@
 
 [English](./README.md) | [中文](./README.zh-CN.md)
 
+> Local fork: upstream **0.1.83** with a lean context-tool entry for **Pi 0.87.1**, retaining configurable BCP delegates. See [local profile, validation and rollback](./LOCAL-LEAN.md); the upstream documentation below also describes the original entry.
+
 <p align="center">
 <strong>Billion-Context</strong> for <a href="https://pi.dev">Pi</a>
 <br />

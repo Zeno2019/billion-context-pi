@@ -281,7 +281,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       const delegateCfg = resolveDelegate(runtime.adapter);
       setDelegateDisplayUsage(delegateCfg.displayUsage);
       setDelegatePolicy(delegateCfg);
-      setDelegateDefaults({ thinkingLevel: delegateCfg.thinkingLevel, agents: delegateCfg.agents });
+      setDelegateDefaults({ thinkingLevel: delegateCfg.thinkingLevel, agents: delegateCfg.agents, contextTools: runtime.adapter.delegateContextTools });
       setDelegateNotifyIfRead(delegateCfg.notifyIfRead);
       // Third-party subagent overlap guard (#415): pi-subagents ships its own
       // sub-agent system (own fleet checker, spawn path, inspector shortcut —
