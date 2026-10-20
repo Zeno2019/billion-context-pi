@@ -4,6 +4,7 @@ import { Check, Clone, Errors } from "typebox/value";
 import type { AdapterConfig } from "./config.js";
 import { createAcpExtension } from "./index.js";
 import { SECTION_KEYS } from "./system-prompt.js";
+import { LEAN_DELEGATE_RULES, withLeanDelegateTools } from "./lean-delegate.js";
 
 // Adapted from kunkun9527/billion-context-pi-lean (MIT); execution stays in this fork.
 export const LEAN_CONTEXT_RULES = `Messages carry hidden \x3cacp\x3e refs such as m00123. Never echo the tags; use refs only in ACP calls.
@@ -106,15 +107,16 @@ export function withLeanContextTools(upstream: ExtensionFactory): ExtensionFacto
 }
 
 export function createLeanAcpExtension(adapter: AdapterConfig = {}): ExtensionFactory {
-  return withLeanContextTools(createAcpExtension({
+  return withLeanDelegateTools(withLeanContextTools(createAcpExtension({
     ...adapter,
     delegateContextTools: ["compress", "acp_context"],
+    delegatePrompt: adapter.delegatePrompt === undefined ? LEAN_DELEGATE_RULES : adapter.delegatePrompt,
     promptSections: {
       ...Object.fromEntries([...SECTION_KEYS].map(key => [key, null])),
       acpTags: LEAN_CONTEXT_RULES,
       ...adapter.promptSections,
     },
-  }));
+  })));
 }
 
 export default createLeanAcpExtension();

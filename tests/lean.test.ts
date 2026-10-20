@@ -13,7 +13,7 @@ import { makeDecompressTool } from "../src/decompress-tool.js";
 import { makeSearchTool } from "../src/search-tool.js";
 import { makeStatusTool } from "../src/status-tool.js";
 import { makeCacheTool } from "../src/cache-tool.js";
-import { ACP_DELEGATE_PROMPT } from "../src/system-prompt.js";
+import { LEAN_DELEGATE_RULES } from "../src/lean-delegate.js";
 import { buildChildArgs, setDelegateDefaults, resetDelegateDefaults } from "../src/delegate-tool.js";
 
 type Tool = ToolDefinition<TSchema, unknown, unknown>;
@@ -219,7 +219,7 @@ test("disabled and proxy upstream factories register no facade", async () => {
 });
 
 test("real lean prompt is short and keeps delegate safety notices and custom prompt overrides", async () => {
-  for (const delegatePrompt of [undefined, "CUSTOM DELEGATE SAFETY"]) {
+  for (const delegatePrompt of [undefined, "CUSTOM DELEGATE SAFETY", null]) {
     const captured = captureApi();
     await createLeanAcpExtension({ autoUpdate: false, delegatePrompt })(captured.api);
     const handlers = captured.handlers.get("before_agent_start") ?? [];
@@ -228,9 +228,11 @@ test("real lean prompt is short and keeps delegate safety notices and custom pro
     const prompt = results.find((value): value is { systemPrompt: string } => typeof value === "object" && value !== null && "systemPrompt" in value);
     assert.ok(prompt);
     assert.ok(prompt.systemPrompt.includes(LEAN_CONTEXT_RULES));
-    assert.ok(prompt.systemPrompt.includes(delegatePrompt ?? ACP_DELEGATE_PROMPT));
+    const expectedDelegate = delegatePrompt === undefined ? LEAN_DELEGATE_RULES : delegatePrompt ?? "";
+    assert.ok(prompt.systemPrompt.includes(expectedDelegate));
+    if (delegatePrompt === null) assert.ok(!prompt.systemPrompt.includes(LEAN_DELEGATE_RULES));
     assert.ok(prompt.systemPrompt.startsWith("BASE"));
-    assert.ok(prompt.systemPrompt.length < (delegatePrompt ?? ACP_DELEGATE_PROMPT).length + LEAN_CONTEXT_RULES.length + 150);
+    assert.ok(prompt.systemPrompt.length < expectedDelegate.length + LEAN_CONTEXT_RULES.length + 150);
     assert.ok(!prompt.systemPrompt.includes("WHEN TO COMPRESS"));
   }
 });
@@ -247,13 +249,21 @@ test("real session_start registers configured agents and supports custom-agent d
     await createLeanAcpExtension({ autoUpdate: false, agentDir: agents, delegate: { forceEnable: true } })(captured.api);
     const ctx = context(root);
     for (const handler of captured.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
-    const listing = await toolNamed(captured.tools, "acp_delegate_agents").execute("list", {}, undefined, undefined, ctx);
+    assert.ok(!captured.tools.has("acp_delegate_wait"));
+    assert.ok(!captured.tools.has("acp_delegate_cancel"));
+    assert.ok(!captured.tools.has("acp_delegate_agents"));
+    const delegate = toolNamed(captured.tools, "acp_delegate");
+    const listing = await delegate.execute("list", { op: "agents" }, undefined, undefined, ctx);
     assert.ok(text(listing).includes("custom-lean"));
-    const plan = await toolNamed(captured.tools, "acp_delegate").execute("plan", { agent: "custom-lean", task: "Inspect", dryRun: true }, undefined, undefined, ctx);
+    const plan = await delegate.execute("plan", { agent: "custom-lean", task: "Inspect", args: { dryRun: true } }, undefined, undefined, ctx);
     assert.ok(text(plan).includes("configured (from agentDir)"), text(plan));
     assert.ok(text(plan).includes("test/test-model"), text(plan));
     assert.ok(text(plan).includes("acp_context"), text(plan));
     assert.ok(!text(plan).includes("Inspect without changing files."));
+    for (const op of ["wait", "cancel"]) {
+      const missing = await delegate.execute(op, { op, runId: "lean-nonexistent-run" }, undefined, undefined, ctx);
+      assert.match(text(missing), /not found|unknown|no .*run/i);
+    }
     for (const handler of captured.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx);
   } finally {
     resetDelegateDefaults();
