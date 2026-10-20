@@ -900,17 +900,18 @@ export function accumulateUsage(a: Usage | undefined, b: Usage): Usage {
 }
 
 
+const AGENT_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  reviewer: "read-only code review (bugs/risks, file:line)",
+  researcher: "read-only codebase investigation",
+  worker: "make code changes (read+edit+write)",
+  planner: "analyze + propose step-by-step plan (read-only)",
+  oracle: "answer questions / advise (read-only)",
+};
+
 const agentListLine = (name: string): string => {
   const def = AGENTS[name];
   if (!def) return "";
-  const blurb: Record<string, string> = {
-    reviewer: "read-only code review (bugs/risks, file:line)",
-    researcher: "read-only codebase investigation",
-    worker: "make code changes (read+edit+write)",
-    planner: "analyze + propose step-by-step plan (read-only)",
-    oracle: "answer questions / advise (read-only)",
-  };
-  return `  • ${name} - ${blurb[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
+  return `  • ${name} - ${AGENT_DESCRIPTIONS[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
 };
 
 export function makeDelegateTool(pi: ExtensionAPI, agentDir?: string): ToolDefinition<typeof DelegateParams> {
@@ -2325,12 +2326,14 @@ function truncate(s: string, n: number): string {
 const AgentListParams = Type.Object({});
 
 /** Format a configured agent entry for the discovery tool output.
- *  Deliberately minimal: name/source/model/thinking/tools policy/timeout -
+ *  Deliberately minimal: public description and routing metadata -
  *  never prompt body, env, credentials, or the absolute source path. */
 function formatConfiguredAgentLine(name: string, def: AgentDirDef, alsoBuiltIn: boolean): string {
   const parts: string[] = [`  • ${name} [configured]`];
   if (alsoBuiltIn) parts.push("(built-in also available)");
+  parts.push(`description: ${def.description ?? "(not provided)"}`);
   parts.push(`model: ${def.model ?? "(inherit)"}`);
+  if (def.allowedModels?.length) parts.push(`allowed-models: ${def.allowedModels.join(", ")}`);
   parts.push(`thinking: ${def.thinking ?? "(not set)"}`);
   if (def.tools && def.tools.length > 0) {
     const merged = withAcpTools(def.tools);
@@ -2347,6 +2350,7 @@ function formatConfiguredAgentLine(name: string, def: AgentDirDef, alsoBuiltIn: 
 function formatBuiltInAgentLine(name: string, def: AgentDef, overridden: boolean): string {
   const parts: string[] = [`  • ${name} [built-in]`];
   if (overridden) parts.push("(overridden by configured - still available)");
+  parts.push(`description: ${AGENT_DESCRIPTIONS[name] ?? "(not provided)"}`);
   parts.push("model: (inherit)");
   parts.push("thinking: (not set)");
   if (def.restricted) {
@@ -2368,7 +2372,7 @@ export function makeDelegateAgentsTool(agentDir?: string): ToolDefinition<typeof
     name: "acp_delegate_agents",
     label: "ACP Delegate Agents",
     description:
-      "List all available delegate agents (built-in roles plus any configured in the agentDir, e.g. ~/.pi/agent/agents). Read-only - no side effects. Shows the effective source, model, thinking, tools policy, and timeout for each agent, plus any configured agent files that failed to parse.",
+      "List delegate agents with public descriptions, configured models, allowed alternatives, thinking, tools, timeout and invalid definitions. Read-only; no prompt bodies. Use dryRun to preview per-call effective settings.",
     promptSnippet: "acp_delegate_agents()",
     promptGuidelines: [
       "Call this before acp_delegate to discover valid agent names and their effective settings.",
@@ -2408,6 +2412,7 @@ export function makeDelegateAgentsTool(agentDir?: string): ToolDefinition<typeof
       }
       lines.push("");
       lines.push("All agents run with fresh context in their own pi process.");
+      lines.push("allowed-models lists explicit choices, not an automatic fallback queue; the default model is also allowed. Use run with dryRun to preview overrides.");
 
       return { details: undefined, content: [{ type: "text", text: lines.join("\n") }] };
     },

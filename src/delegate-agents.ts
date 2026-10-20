@@ -27,6 +27,8 @@ export interface AgentDirDef {
   name: string;
   /** System prompt body (Markdown after frontmatter). Must be non-empty. */
   prompt: string;
+  /** Short public role description for on-demand discovery. */
+  description?: string;
   /** Model override as "provider/id", or undefined to inherit parent. */
   model?: string;
   /** Thinking level override, or undefined. */
@@ -150,6 +152,10 @@ async function loadAgentFile(
     prompt: body,
     sourcePath: filePath,
   };
+
+  if (frontmatter.description?.trim()) {
+    def.description = frontmatter.description.trim().replace(/\s+/g, " ").slice(0, 240);
+  }
 
   if (frontmatter.model !== undefined && frontmatter.model.length > 0) {
     def.model = frontmatter.model;
