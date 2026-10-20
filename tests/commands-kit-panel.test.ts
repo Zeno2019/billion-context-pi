@@ -3,10 +3,8 @@ import assert from "node:assert/strict";
 import type { AcpRuntime } from "../src/runtime.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-// tsup defines CURRENT_VERSION at build time; under the node test runner it
-// is bare, so stub it before the module graph reads it.
-(globalThis as Record<string, unknown>).CURRENT_VERSION ??= "0.0.0-test";
-const { makeCommands } = await import("../src/commands.js");
+import { makeCommands } from "../src/commands.js";
+import { version } from "../package.json";
 
 function fakeRuntime(): AcpRuntime {
   return {
@@ -44,6 +42,7 @@ test("/acp panel (kit-rendered) separates session accounting from sent view", as
   await acp.options.handler!("", ctx);
 
   const text = notified[0] ?? "";
+  assert.ok(text.includes(`billion-context-pi@${version}`));
   assert.match(text, /Context \(session accounting, host footer scale\): 43% \(430k \/ 1\.0M\) — includes compressed originals; shrinks slower than the sent view/, text);
   assert.match(text, /Sent to LLM \(after compression, est\.\): 24k \(2% of limit\)/, text);
   // unprunedTokens is passed from the same projection — Session-only derives

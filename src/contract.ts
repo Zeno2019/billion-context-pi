@@ -1,3 +1,4 @@
+import { version as CURRENT_VERSION } from "../package.json";
 /**
  * Machine-readable contract for the `<sessionFile>.acp.json` sidecar (#368).
  *
@@ -52,7 +53,5 @@ export interface BcpSidecarV1 {
 }
 
 export function sidecarProducer(): string {
-  return `billion-context-pi@${typeof CURRENT_VERSION !== "undefined" ? CURRENT_VERSION : "dev"}`;
+  return `billion-context-pi@${CURRENT_VERSION}`;
 }
-
-declare const CURRENT_VERSION: string;

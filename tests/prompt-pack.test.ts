@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { version } from "../package.json";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -422,4 +423,8 @@ test("resolveSurfaceMeta falls back to default for an unknown pack name", () => 
   const adapter = { compress: { promptPack: "no-such-pack-xyz" } } satisfies AdapterConfig;
   const meta = resolveSurfaceMeta(adapter, tmpdir());
   assert.equal(meta.pack, "default");
+});
+
+test("source-loaded surface identifies the package version", () => {
+  assert.equal(resolveSurfaceMeta({}, process.cwd()).host, `billion-context-pi ${version}`);
 });

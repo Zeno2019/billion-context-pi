@@ -13,7 +13,7 @@
 | Language | TypeScript (strict, ESM) |
 | Build | tsup (bundling, inlines acp-kernel) |
 | Test | Node.js built-in: `node --import tsx --test tests/*.test.ts` |
-| Runtime Dep | `acp-kernel` (bundled at build time, zero runtime deps in dist) |
+| Runtime Dep | `acp-kernel` (runtime dependency for Pi source loading; bundled in dist) |
 | Host | Pi `@earendil-works/pi-coding-agent` >=0.83 |
 
 ### Repository Info
@@ -59,7 +59,7 @@ pi-acp/
 3. **Assistant messages skip tag injection** — prevents model echo of XML tags
 4. **Tags appended to END of text** — matches opencode-acp pattern
 5. **Auto-update on session_start** — checks npm registry (6h throttle), auto-installs if newer
-6. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.14"`, NEVER `"^0.0.14"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
+6. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.14"`, NEVER `"^0.0.14"`). Because acp-kernel is used directly by Pi source loading and bundled inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
 
 ### Kernel Contract: Message Ids Are Never Reused
 
@@ -91,9 +91,10 @@ npm test               # node --import tsx --test tests/*.test.ts
 ### Local Testing
 
 ```bash
-npm run build
-cp dist/index.js ~/.pi/agent/npm/node_modules/billion-context-pi/dist/index.js
-# Restart Pi to pick up changes
+npm run typecheck
+npm test
+# Pi loads src/lean.ts directly; restart Pi after source changes.
+# npm/library consumers additionally require npm run build.
 ```
 
 ### Code Quality
@@ -123,7 +124,7 @@ Same baseline as acp-kernel (branch naming, CI auto-publish, PR-merge-is-human-o
 
 ### Cross-repo dependency: acp-kernel MUST ship first
 
-`acp-kernel` is pinned in **devDependencies** (exact version, no `^`) and **bundled inline** at build time (tsup does NOT mark it `external`), so `dist/index.js` is self-contained.
+`acp-kernel` is pinned in **dependencies** (exact version, no `^`) and **bundled inline** at build time (tsup does NOT mark it `external`), so `dist/index.js` is self-contained.
 
 ⚠️ **Publishing order is strict:**
 1. Release `acp-kernel` first (open + merge its release PR, wait for CI publish).

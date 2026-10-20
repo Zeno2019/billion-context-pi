@@ -1,3 +1,4 @@
+import { version as CURRENT_VERSION } from "../package.json";
 import { readFile, writeFile, mkdir, access } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,8 +7,6 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { CONFIG_DIR_NAME } from "./config-dir.js";
 import { debug, logInfo, logWarn } from "./log.js";
-
-declare const CURRENT_VERSION: string;
 
 const PACKAGE_NAME = "billion-context-pi";
 const registryUrl = (tag: string) =>

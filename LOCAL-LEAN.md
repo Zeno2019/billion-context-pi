@@ -4,7 +4,7 @@
 
 此 fork 已合并正式上游 `v0.1.83`（`1cb6340`），保留 `f9757ee` 引入的自定义代理定义。Pi 固定为 **0.87.1**，`acp-kernel` 固定为 **0.0.98**。参考 [kunkun9527/billion-context-pi-lean](https://github.com/kunkun9527/billion-context-pi-lean/tree/d0b3c396739a17f97dd9dac2d7dd690d000f13fc)（`0.2.1`，基于 `0.1.83`）的工具合并及短提示思路，仅移植这个范围。
 
-- Pi 从 `dist/lean.js` 加载；原 `dist/index.js` 工厂仍供程序调用和上游测试使用。`src/lean.ts` 调用本 fork 的工厂，复用现有 `promptSections` 配置机制，没有替换事件钩子。
+- Pi 从 `src/lean.ts` 加载；`dist/index.js` 仍是 npm/library 构建入口。`src/lean.ts` 调用本 fork 的工厂，复用现有 `promptSections` 配置机制，没有替换事件钩子。
 - `compress` 保持原名、schema 约束、执行与结果，仅精简说明。`decompress`、`search_context`、`acp_status`、`acp_cache` 合并为 `acp_context({op,args})`；冷门参数通过 `{op:"help",args:{tool:"decompress"}}` 查询。派发前按原 schema 校验。
 - 召回正文、压缩结果、持久化细节与进度回调原样转发；上游提示中的旧工具名视为 `acp_context` 的操作名，不对历史内容做文本替换。
 - 委派能力收敛为单个 `acp_delegate`，支持 `run`（默认）、`wait`、`cancel`、`agents`、`help`。常用参数 `agent/task/runId/async` 直接显示；模型、思考级别、工作目录、超时、dryRun、resumeFrom 等原有高级参数通过 `args` 传入。`{op:"help"}` 默认展示 run 的原 schema；`{op:"help",args:{op:"wait"}}` 展示其他操作。字段重复或不属于该操作时拒绝派发，不做静默覆盖。
@@ -35,7 +35,7 @@
 
 ### 维护和回退
 
-源码位于 `$PROJECTS_ROOT/billion-context-pi`；Pi 现有本地链接仍使用它。全局 `$HOME/.pi/acp.json` 保留 `autoUpdate:false`、`delegate:true` 和原 `agentDir`，无需再添加一层包装包或开启专用压缩模型。
+开发源码位于 `$PROJECTS_ROOT/billion-context-pi`；GitHub 安装使用 Pi 管理的 Git 缓存。当前全局 `$HOME/.pi/acp.json` 保留 `autoUpdate:false`、`delegate:false` 和原 `agentDir`，无需再添加一层包装包或开启专用压缩模型。
 
 后续更新先比较上游的工具 schema、返回值和委派白名单逻辑，再运行 typecheck、全部测试、build。`tests/lean.test.ts`、`tests/lean-delegate.test.ts`、`tests/lean-routing.test.ts` 和 `tests/setup-subagent-tools.test.ts` 覆盖外壳、模型链及子代理工具名；`dist` 是构建产物，不手改。入口变更在新会话生效。
 
@@ -47,11 +47,11 @@
 
 ## English
 
-This local fork merges upstream **v0.1.83**, keeps **Pi 0.87.1 / acp-kernel 0.0.98**, and retains configurable delegates. Its Pi entry is `dist/lean.js`; the original factory remains in `dist/index.js`.
+This local fork merges upstream **v0.1.83**, keeps **Pi 0.87.1 / acp-kernel 0.0.98**, and retains configurable delegates. Its Pi entry is `src/lean.ts`; `dist/index.js` remains the npm/library build entry.
 
 Inspired by kunkun9527's MIT-licensed lean fork, it keeps `compress` direct and groups the four low-frequency context tools under `acp_context({op,args})`. Delegation now uses one `acp_delegate` entry with run (default), wait, cancel, agents and help. Common fields stay visible; advanced original parameters go inside args. Help returns each original schema, conflicting/unknown fields are rejected, and execution/results/history remain unchanged. The shortened delegate prompt retains timeout, notification-trust and failed-work rules. Registration follows the original session_start enablement and refreshes captured definitions without duplicating tools. Restricted delegate allowlists and explicit `/acp-subagents` setup keep the context tool names without granting extra non-ACP tools. Explicit user prompt overrides remain authoritative and can increase the footprint.
 
-Dedicated summary models, idle compression and other reference-fork runtime changes are outside this port. The global auto-update-off, delegate-on and agentDir settings are unchanged. Use only one BCP extension entry.
+Dedicated summary models, idle compression and other reference-fork runtime changes are outside this port. The current global auto-update-off, delegate-off and agentDir settings are unchanged. Use only one BCP extension entry.
 
 Before the first delegation, query agents when the roster/settings are not already known; reuse the result until configuration changes. Discovery includes public descriptions (single-line frontmatter description, capped at 240 characters), configured models, allowed-models and thinking. It never extracts the private role prompt. Model priority remains call > agent file > role configuration > parent; thinking remains call > agent file > role > global > Pi default. The allowlist supports explicit choices, not automatic failover. All six real agent files remain unchanged; 116 before/after dry runs and actual CLI argument checks agree, and all six out-of-list probes are rejected.
 
@@ -59,6 +59,16 @@ At the same settings, resident BCP metadata and prompt text decrease from **36,5
 
 Validation: typecheck, build, full serial suite (1118 passed, 3 skipped), and actual Pi 0.87.1 loader/operation/dry-run checks. Serial execution avoids the pre-existing shared-temp cleanup race between delegate-tool and fleet tests. No models or browsers were called.
 
-Maintain source and regression tests, then rebuild dist. Configuration/build backups and verification scripts are under `$HOME/.pi/maintenance/bcp-lean-20261020/` and `$HOME/.pi/maintenance/bcp-delegate-lean-20261020/`; the original 0.1.82 branch and pre-delegate-lean commit `b7c69fd` are retained for rollback. New sessions load the changed entry.
+Maintain source and regression tests; rebuild dist for npm/library consumers. Configuration/build backups and verification scripts are under `$HOME/.pi/maintenance/bcp-lean-20261020/` and `$HOME/.pi/maintenance/bcp-delegate-lean-20261020/`; the original 0.1.82 branch and pre-delegate-lean commit `b7c69fd` are retained for rollback. New sessions load the changed entry.
 
 Discovery/routing verification and the preceding `f621ec2` build are saved under `$HOME/.pi/maintenance/bcp-discovery-20261020/`.
+
+## GitHub source installation / GitHub 源码安装
+
+```bash
+pi install git:github.com/Zeno2019/billion-context-pi
+```
+
+默认主分支直接提供 Pi 的 TypeScript 入口 `src/lean.ts`。正常生产依赖安装只引入精确固定的 `acp-kernel@0.0.98`；可选 peer 由 Pi 宿主加载器提供，不另装 Pi 运行时。无需构建步骤或特殊 npm 配置。`dist/` 保持忽略且不提交。`main`、`types` 和 `exports` 保留为 npm/library 的构建入口，发布 npm 包前仍需 `npm run build`；这与 Pi 的源码入口独立。
+
+The default branch exposes `src/lean.ts` directly to Pi. A normal production dependency install adds only the pinned `acp-kernel@0.0.98`; Pi supplies the optional host peers through its loader. No build step or special npm configuration is required. Keep `dist/` ignored and untracked. The `main`, `types` and `exports` fields remain build entries for npm/library consumers, so npm publication still requires `npm run build`.

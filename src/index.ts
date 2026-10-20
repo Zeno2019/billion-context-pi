@@ -1,3 +1,4 @@
+import { version as CURRENT_VERSION } from "../package.json";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -64,8 +65,6 @@ export type { AcpRuntime, SessionRef } from "./runtime.js";
 export { deriveChildState } from "./state.js";
 
 type AgentMessage = SessionMessageEntry["message"];
-
-declare const CURRENT_VERSION: string;
 
 export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactory {
   return (pi: ExtensionAPI) => {
@@ -274,7 +273,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     // never said which model it was. id + contextWindow also catch window
     // misconfigurations.
     const modelInfo = ctx.model as { id?: string; contextWindow?: number; api?: string } | undefined;
-    logInfo("session", { event: "start", sid, cwd: ctx.cwd, debug: runtime.adapter.debug ?? null, version: typeof CURRENT_VERSION !== "undefined" ? CURRENT_VERSION : null, model: modelInfo?.id ?? null, modelApi: modelInfo?.api ?? null, contextWindow: modelInfo?.contextWindow ?? null });
+    logInfo("session", { event: "start", sid, cwd: ctx.cwd, debug: runtime.adapter.debug ?? null, version: CURRENT_VERSION, model: modelInfo?.id ?? null, modelApi: modelInfo?.api ?? null, contextWindow: modelInfo?.contextWindow ?? null });
     let delegateStoodDown = false;
     try {
       await runtime.reloadConfig(ctx.cwd);

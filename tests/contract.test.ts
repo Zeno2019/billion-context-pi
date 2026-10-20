@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { version } from "../package.json";
 import assert from "node:assert/strict";
 import { readFile, rm } from "node:fs/promises";
 import { SIDECAR_SCHEMA_VERSION, sidecarProducer, type BcpBlockV1, type BcpSidecarV1 } from "../src/contract.js";
@@ -46,7 +47,7 @@ test("saved sidecar carries schemaVersion/producer and BcpBlockV1-shaped blocks"
 });
 
 test("sidecarProducer identifies the writer", () => {
-  assert.match(sidecarProducer(), /^billion-context-pi@/);
+  assert.equal(sidecarProducer(), `billion-context-pi@${version}`);
 });
 
 // #368: blocks persist verbatim as kernel CompressionBlock. The exported

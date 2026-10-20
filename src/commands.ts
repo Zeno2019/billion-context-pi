@@ -1,3 +1,4 @@
+import { version as CURRENT_VERSION } from "../package.json";
 import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand, SessionEntry } from "@earendil-works/pi-coding-agent";
 import * as path from "node:path";
 import type { AcpRuntime } from "./runtime.js";
@@ -15,8 +16,6 @@ import { openFleetInspector } from "./fleet-inspector.js";
 import { resolveDelegate } from "./config.js";
 import { ensureSubagentAcpTools } from "./setup-subagent-tools.js";
 import { cacheReportText } from "./cache-tool.js";
-
-declare const CURRENT_VERSION: string;
 
 type CommandOptions = Omit<RegisteredCommand, "name" | "sourceInfo">;
 
@@ -338,9 +337,7 @@ async function statusReport(runtime: AcpRuntime, ctx: ExtensionCommandContext): 
   // systemPromptTokens (measured) and unprunedTokens — the chars/4 estimate
   // of the full projection, so the kit derives Session-only on the same
   // estimation scale as the sent view (never cross-scale; omp issue #18).
-  const versionStr = CURRENT_VERSION
-    ? `billion-context-pi@${CURRENT_VERSION} · pack: ${resolveSurfaceMeta(runtime.adapter, ctx?.cwd ?? process.cwd(), (ctx?.model as { provider?: string; id?: string } | undefined)?.provider, (ctx?.model as { provider?: string; id?: string } | undefined)?.id).pack}`
-    : undefined;
+  const versionStr = `billion-context-pi@${CURRENT_VERSION} · pack: ${resolveSurfaceMeta(runtime.adapter, ctx?.cwd ?? process.cwd(), (ctx?.model as { provider?: string; id?: string } | undefined)?.provider, (ctx?.model as { provider?: string; id?: string } | undefined)?.id).pack}`;
   let text = buildStatusPanel({
     version: versionStr,
     tokenCount: sessionTokens,

@@ -1,3 +1,4 @@
+import { version as CURRENT_VERSION } from "../package.json";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -53,15 +54,6 @@ export function resolveActivePack(
   return r.resolve(name) ?? defaultPack;
 }
 
-declare const CURRENT_VERSION: string;
-
-const HOST_VERSION: string = (() => {
-  try {
-    return CURRENT_VERSION;
-  } catch {
-    return "dev";
-  }
-})();
 
 export interface SurfaceMeta {
   pack: string;
@@ -73,7 +65,7 @@ export interface SurfaceMeta {
  *  when the caller already holds the active Pack). */
 export function surfaceMetaOf(pack: Pack, requested: string): SurfaceMeta {
   const resolved = requested !== "default" && pack.name === requested ? requested : "default";
-  return { pack: resolved, packVersion: pack.version, host: `billion-context-pi ${HOST_VERSION}` };
+  return { pack: resolved, packVersion: pack.version, host: `billion-context-pi ${CURRENT_VERSION}` };
 }
 
 /** Host-declared surface facts for the kernel's status reports (acp-kernel
